@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# FFmpeg binaries
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
+
+# Runtime settings
+settings.json
+
+# Screen recordings output
+ScreenCaptures/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+tmp/

@@ -1,0 +1,62 @@
+import json
+import os
+import threading
+
+DEFAULT_SETTINGS = {
+    "fps": 30,
+    "encoder": "mpeg4",
+    "draw_mouse": True,
+    "audio_mode": "default",
+    "audio_devices": [],
+}
+
+
+class SettingsManager:
+    def __init__(self, base_dir):
+        self._path = os.path.join(base_dir, "settings.json")
+        self._lock = threading.Lock()
+        self._settings = dict(DEFAULT_SETTINGS)
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(self._path):
+                with open(self._path, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                self._settings.update(saved)
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    def _save(self):
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(self._settings, f, indent=2)
+
+    def get_all(self):
+        with self._lock:
+            return dict(self._settings)
+
+    def get(self, key, default=None):
+        with self._lock:
+            return self._settings.get(key, default)
+
+    def update(self, changes):
+        with self._lock:
+            if "fps" in changes:
+                try:
+                    fps = int(changes["fps"])
+                    self._settings["fps"] = max(1, min(120, fps))
+                except (ValueError, TypeError):
+                    pass
+            if "encoder" in changes and changes["encoder"] in ("mpeg4", "h264_nvenc"):
+                self._settings["encoder"] = changes["encoder"]
+            if "draw_mouse" in changes:
+                self._settings["draw_mouse"] = bool(changes["draw_mouse"])
+            if "audio_mode" in changes and changes["audio_mode"] in ("default", "selected"):
+                self._settings["audio_mode"] = changes["audio_mode"]
+            if "audio_devices" in changes and isinstance(changes["audio_devices"], list):
+                self._settings["audio_devices"] = [
+                    int(d) for d in changes["audio_devices"]
+                    if isinstance(d, (int, float))
+                ]
+            self._save()
+        return self.get_all()
