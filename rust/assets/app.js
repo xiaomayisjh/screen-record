@@ -534,6 +534,9 @@ const App = {
                 const selectedDevices = this.settings.audio_devices || [];
                 audList.innerHTML = this.devices.audio.map(dev => {
                     const checked = selectedDevices.includes(dev.name) ? 'checked' : '';
+                    const typeLabel = dev.device_type === 'output'
+                        ? '<span class="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">扬声器</span>'
+                        : '<span class="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">麦克风</span>';
                     return `
                         <label class="flex items-center gap-3 py-2 px-2 rounded-lg hover:bg-slate-700 cursor-pointer
                                       transition-colors duration-200 min-h-[44px]">
@@ -542,13 +545,13 @@ const App = {
                                        focus:ring-blue-500/50 cursor-pointer"
                                 onchange="App.debounceSaveSettings()">
                             <div class="min-w-0 flex-1">
-                                <p class="text-sm text-slate-200 truncate">${this.escapeHtml(dev.name)}</p>
+                                <p class="text-sm text-slate-200 truncate">${this.escapeHtml(dev.name)} ${typeLabel}</p>
                             </div>
                         </label>
                     `;
                 }).join('');
             } else {
-                audList.innerHTML = '<p class="text-slate-500 text-sm py-2">No audio input devices found</p>';
+                audList.innerHTML = '<p class="text-slate-500 text-sm py-2">No audio devices found</p>';
             }
         } catch (err) { /* silently fail */ }
     },

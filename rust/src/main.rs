@@ -23,6 +23,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use chrono::Local;
 use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex};
 use tokio_stream::Stream;
@@ -143,9 +144,11 @@ struct DevicesResponse {
     webcam: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AudioDeviceInfo {
     name: String,
+    /// "input" (microphone) or "output" (speaker/loopback)
+    device_type: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -361,29 +364,180 @@ fn build_capture_cmd(
     cmd
 }
 
-fn build_audio_capture_cmd(
-    ffmpeg: &Path,
+/// A handle to a cpal audio recording thread. Drop or call stop() to finish.
+struct CpalRecordingHandle {
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CpalRecordingHandle {
+    fn stop(&mut self) {
+        self.stop_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for CpalRecordingHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Start recording audio from a cpal device to a WAV file.
+/// For output devices, WASAPI loopback is automatically enabled by cpal.
+fn start_cpal_recording(
     device_name: &str,
-    output_wav: &Path,
-) -> Vec<String> {
-    vec![
-        ffmpeg.to_string_lossy().to_string(),
-        "-f".to_string(),
-        "dshow".to_string(),
-        // Use small buffer to reduce latency and avoid exclusive access on some drivers
-        "-audio_buffer_size".to_string(),
-        "50".to_string(),
-        "-i".to_string(),
-        format!("audio={}", device_name),
-        "-ac".to_string(),
-        "2".to_string(),
-        "-ar".to_string(),
-        "44100".to_string(),
-        "-acodec".to_string(),
-        "pcm_s16le".to_string(),
-        "-y".to_string(),
-        output_wav.to_string_lossy().to_string(),
-    ]
+    device_type: &str,
+    output_path: PathBuf,
+) -> Result<CpalRecordingHandle, String> {
+    let host = cpal::default_host();
+
+    // Find the device by name and type
+    let device = if device_type == "output" {
+        host.output_devices()
+            .map_err(|e| format!("Failed to enumerate output devices: {}", e))?
+            .find(|d| d.name().map(|n| n == device_name).unwrap_or(false))
+    } else {
+        host.input_devices()
+            .map_err(|e| format!("Failed to enumerate input devices: {}", e))?
+            .find(|d| d.name().map(|n| n == device_name).unwrap_or(false))
+    };
+
+    let device = device.ok_or_else(|| format!("Audio device not found: {}", device_name))?;
+
+    // For loopback (output devices used as input), cpal WASAPI automatically sets
+    // AUDCLNT_STREAMFLAGS_LOOPBACK when build_input_stream is called on an output device.
+    let config = device
+        .default_input_config()
+        .or_else(|_| device.default_output_config())
+        .map_err(|e| format!("No supported audio config for {}: {}", device_name, e))?;
+
+    let sample_format = config.sample_format();
+    let wav_spec = hound::WavSpec {
+        channels: config.channels(),
+        sample_rate: config.sample_rate().0,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_clone = stop_flag.clone();
+    let config = config.into();
+
+    let thread = std::thread::spawn(move || {
+        let writer = match hound::WavWriter::create(&output_path, wav_spec) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!("Failed to create WAV file {:?}: {}", output_path, e);
+                return;
+            }
+        };
+        let writer = Arc::new(std::sync::Mutex::new(Some(writer)));
+        let writer_clone = writer.clone();
+
+        let err_fn = |err: cpal::StreamError| {
+            tracing::warn!("Audio stream error: {}", err);
+        };
+
+        let stream = match sample_format {
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &config,
+                {
+                    let writer = writer.clone();
+                    let stop = stop_clone.clone();
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Ok(mut guard) = writer.lock() {
+                            if let Some(ref mut w) = *guard {
+                                for &sample in data {
+                                    let _ = w.write_sample(sample);
+                                }
+                            }
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &config,
+                {
+                    let writer = writer.clone();
+                    let stop = stop_clone.clone();
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Ok(mut guard) = writer.lock() {
+                            if let Some(ref mut w) = *guard {
+                                for &sample in data {
+                                    let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                    let _ = w.write_sample(s);
+                                }
+                            }
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            ),
+            _ => device.build_input_stream(
+                &config,
+                {
+                    let writer = writer.clone();
+                    let stop = stop_clone.clone();
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        if let Ok(mut guard) = writer.lock() {
+                            if let Some(ref mut w) = *guard {
+                                for &sample in data {
+                                    let _ = w.write_sample(sample);
+                                }
+                            }
+                        }
+                    }
+                },
+                err_fn,
+                None,
+            ),
+        };
+
+        match stream {
+            Ok(stream) => {
+                if let Err(e) = stream.play() {
+                    tracing::error!("Failed to start audio stream: {}", e);
+                    return;
+                }
+                // Wait until stopped
+                while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                drop(stream);
+            }
+            Err(e) => {
+                tracing::error!("Failed to build audio input stream: {}", e);
+            }
+        }
+
+        // Finalize WAV file
+        if let Ok(mut guard) = writer_clone.lock() {
+            if let Some(w) = guard.take() {
+                let _ = w.finalize();
+            }
+        };
+    });
+
+    Ok(CpalRecordingHandle {
+        stop_flag,
+        thread: Some(thread),
+    })
 }
 
 fn build_webcam_cmd(ffmpeg: &Path, device_name: &str, output: &Path) -> Vec<String> {
@@ -513,7 +667,7 @@ struct DeviceEnumerator {
 #[derive(Debug, Clone)]
 struct DeviceList {
     webcam: Vec<String>,
-    microphone: Vec<String>,
+    audio: Vec<AudioDeviceInfo>,
 }
 
 impl DeviceEnumerator {
@@ -533,6 +687,19 @@ impl DeviceEnumerator {
             }
         }
 
+        // Enumerate audio devices via cpal (supports WASAPI loopback for output devices)
+        let audio = enumerate_audio_devices();
+
+        // Enumerate webcams via FFmpeg dshow (cpal doesn't handle video)
+        let webcam = self.enumerate_webcams();
+
+        let result = DeviceList { webcam, audio };
+        self.cache = Some(result.clone());
+        self.cache_time = Instant::now();
+        result
+    }
+
+    fn enumerate_webcams(&self) -> Vec<String> {
         let mut cmd = Command::new(&self.ffmpeg_path);
         cmd.args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
             .stdout(Stdio::piped())
@@ -541,109 +708,100 @@ impl DeviceEnumerator {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let output = cmd.spawn()
-            .and_then(|child| child.wait_with_output());
+        let output = cmd.spawn().and_then(|child| child.wait_with_output());
 
         match output {
             Ok(out) => {
                 let text = String::from_utf8_lossy(&out.stdout).to_string()
                     + &String::from_utf8_lossy(&out.stderr);
-
-                let result = parse_dshow_devices(&text);
-                self.cache = Some(result.clone());
-                self.cache_time = Instant::now();
-                result
+                parse_dshow_webcams(&text)
             }
-            Err(_) => DeviceList {
-                webcam: vec![],
-                microphone: vec![],
-            },
+            Err(_) => vec![],
         }
     }
 }
 
-/// Parse FFmpeg dshow device listing output.
-///
-/// Supports both old format (section headers "DirectShow video/audio devices")
-/// and new FFmpeg 7.x format (per-line "(video)" / "(audio)" tags).
-fn parse_dshow_devices(output: &str) -> DeviceList {
-    let mut webcams = vec![];
-    let mut microphones = vec![];
+/// Enumerate audio devices via cpal. Input devices get type "input", output devices get "output".
+/// Output devices can be used for WASAPI loopback (recording system audio).
+fn enumerate_audio_devices() -> Vec<AudioDeviceInfo> {
+    let mut devices = vec![];
+    let host = cpal::default_host();
 
-    // Detect format: new FFmpeg 7.x uses per-line "(video)" / "(audio)" tags
-    let has_per_line_tags = output.lines().any(|l| {
-        let trimmed = l.trim();
-        trimmed.ends_with("(video)") || trimmed.ends_with("(audio)")
-    });
-
-    if has_per_line_tags {
-        // New format: each device line ends with (video) or (audio)
-        // [dshow @ ...] "Device Name" (video)
-        // [dshow @ ...] "Device Name" (audio)
-        for line in output.lines() {
-            let bracket_end = match line.find(']') {
-                Some(i) => i,
-                None => continue,
-            };
-            let remainder = line[bracket_end + 1..].trim();
-
-            let (name_part, dev_type) = if remainder.ends_with("(video)") {
-                (&remainder[..remainder.len() - 7], "video")
-            } else if remainder.ends_with("(audio)") {
-                (&remainder[..remainder.len() - 7], "audio")
-            } else {
-                continue;
-            };
-
-            let name = name_part.trim().trim_matches('"');
-            if name.is_empty() || name.starts_with("Alternative name") {
-                continue;
-            }
-
-            match dev_type {
-                "video" => webcams.push(name.to_string()),
-                "audio" => microphones.push(name.to_string()),
-                _ => {}
+    // Input devices (microphone, line-in, stereo mix, etc.)
+    if let Ok(inputs) = host.input_devices() {
+        for dev in inputs {
+            if let Ok(name) = dev.name() {
+                devices.push(AudioDeviceInfo {
+                    name,
+                    device_type: "input".to_string(),
+                });
             }
         }
-    } else {
-        // Old format: section headers "DirectShow video devices" / "DirectShow audio devices"
-        let mut in_audio_section = false;
-        for line in output.lines() {
-            if line.contains("DirectShow audio") {
-                in_audio_section = true;
-                continue;
-            }
-            if line.contains("DirectShow video") {
-                in_audio_section = false;
-                continue;
-            }
+    }
 
+    // Output devices (speakers, headphones) — available for loopback capture
+    if let Ok(outputs) = host.output_devices() {
+        for dev in outputs {
+            if let Ok(name) = dev.name() {
+                devices.push(AudioDeviceInfo {
+                    name,
+                    device_type: "output".to_string(),
+                });
+            }
+        }
+    }
+
+    devices
+}
+
+/// Parse FFmpeg dshow output for video (webcam) devices only.
+fn parse_dshow_webcams(output: &str) -> Vec<String> {
+    let mut webcams = vec![];
+
+    // FFmpeg 7.x: per-line "(video)" tag
+    let has_per_line_tags = output
+        .lines()
+        .any(|l| l.trim().ends_with("(video)") || l.trim().ends_with("(audio)"));
+
+    if has_per_line_tags {
+        for line in output.lines() {
             let bracket_end = match line.find(']') {
                 Some(i) => i,
                 None => continue,
             };
             let remainder = line[bracket_end + 1..].trim();
-            if !remainder.starts_with('"') {
+            if !remainder.ends_with("(video)") {
                 continue;
             }
-            let name = remainder.trim_matches(|c: char| c == '"' || c == ' ');
-            if name.is_empty() {
-                continue;
-            }
-
-            if in_audio_section {
-                microphones.push(name.to_string());
-            } else {
+            let name_part = &remainder[..remainder.len() - 7];
+            let name = name_part.trim().trim_matches('"');
+            if !name.is_empty() && !name.starts_with("Alternative name") {
                 webcams.push(name.to_string());
             }
         }
+    } else {
+        // Old format: section before "DirectShow audio"
+        let section = if let Some(idx) = output.find("DirectShow audio") {
+            &output[..idx]
+        } else {
+            output
+        };
+        for line in section.lines() {
+            let bracket_end = match line.find(']') {
+                Some(i) => i,
+                None => continue,
+            };
+            let remainder = line[bracket_end + 1..].trim();
+            if remainder.starts_with('"') {
+                let name = remainder.trim_matches(|c: char| c == '"' || c == ' ');
+                if !name.is_empty() {
+                    webcams.push(name.to_string());
+                }
+            }
+        }
     }
 
-    DeviceList {
-        webcam: webcams,
-        microphone: microphones,
-    }
+    webcams
 }
 
 // ============================================================
@@ -657,9 +815,9 @@ struct EngineInner {
     audio_start: Option<Instant>,
     error_message: Option<String>,
     video_process: Option<Child>,
-    audio_processes: Vec<Child>,
+    audio_handles: Vec<CpalRecordingHandle>,
     webcam_process: Option<Child>,
-    audio_device_names: Vec<String>,
+    audio_device_count: usize,
     has_webcam: bool,
 }
 
@@ -672,9 +830,9 @@ impl Default for EngineInner {
             audio_start: None,
             error_message: None,
             video_process: None,
-            audio_processes: vec![],
+            audio_handles: vec![],
             webcam_process: None,
-            audio_device_names: vec![],
+            audio_device_count: 0,
             has_webcam: false,
         }
     }
@@ -771,18 +929,35 @@ impl RecordingEngine {
 
         // Determine audio devices (may need device_enumerator lock, done before inner lock)
         let no_audio = settings.audio_mode == "disabled";
-        let audio_devices: Vec<String> = if no_audio {
+        let audio_devices: Vec<AudioDeviceInfo> = if no_audio {
             vec![]
         } else if settings.audio_mode == "selected" && !settings.audio_devices.is_empty() {
-            settings.audio_devices.clone()
+            // Look up device types from cpal enumeration
+            let all_devs = self.device_enumerator.lock().await.list_all();
+            settings
+                .audio_devices
+                .iter()
+                .map(|name| {
+                    let dev_type = all_devs
+                        .audio
+                        .iter()
+                        .find(|d| d.name == *name)
+                        .map(|d| d.device_type.clone())
+                        .unwrap_or_else(|| "input".to_string());
+                    AudioDeviceInfo {
+                        name: name.clone(),
+                        device_type: dev_type,
+                    }
+                })
+                .collect()
         } else {
-            // Default mode: get first audio device
+            // Default mode: get first input audio device
             let devs = self.device_enumerator.lock().await.list_all();
-            if devs.microphone.is_empty() {
-                vec![]
-            } else {
-                vec![devs.microphone[0].clone()]
-            }
+            devs.audio
+                .into_iter()
+                .filter(|d| d.device_type == "input")
+                .take(1)
+                .collect()
         };
 
         // Spawn video capture process (blocking I/O, before inner lock)
@@ -793,22 +968,23 @@ impl RecordingEngine {
 
         let recording_start = Instant::now();
 
-        // Spawn audio capture processes (blocking I/O, before inner lock)
-        let mut audio_procs = vec![];
-        let mut audio_device_names = vec![];
+        // Start audio recording via cpal (supports both input devices and output loopback)
+        let mut audio_handles: Vec<CpalRecordingHandle> = vec![];
         let audio_start = if !audio_devices.is_empty() {
             let start = Instant::now();
-            for (i, dev_name) in audio_devices.iter().enumerate() {
+            for (i, dev) in audio_devices.iter().enumerate() {
                 let wav_path = self.tmp_dir.join(format!("tmp_{}.wav", i));
-                let audio_cmd =
-                    build_audio_capture_cmd(&self.ffmpeg_path, dev_name, &wav_path);
-                match spawn_ffmpeg(&audio_cmd, None) {
-                    Ok(proc) => {
-                        audio_procs.push(proc);
-                        audio_device_names.push(dev_name.clone());
+                match start_cpal_recording(&dev.name, &dev.device_type, wav_path) {
+                    Ok(handle) => {
+                        audio_handles.push(handle);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to start audio capture for {}: {}", dev_name, e);
+                        tracing::warn!(
+                            "Failed to start audio capture for {} ({}): {}",
+                            dev.name,
+                            dev.device_type,
+                            e
+                        );
                     }
                 }
             }
@@ -847,24 +1023,27 @@ impl RecordingEngine {
         if inner.state != RecordingState::Idle {
             // Already recording — kill the processes we just spawned
             drop(inner);
-            // Clean up spawned processes in background
             let mut vp = Some(video_proc);
             let mut wp = webcam_proc;
             tokio::task::spawn_blocking(move || {
                 if let Some(ref mut p) = vp { let _ = p.kill(); let _ = p.wait(); }
-                for mut p in audio_procs { let _ = p.kill(); let _ = p.wait(); }
                 if let Some(ref mut p) = wp { let _ = p.kill(); let _ = p.wait(); }
             });
+            // Stop cpal audio handles
+            for mut h in audio_handles {
+                h.stop();
+            }
             return Err("Already recording or merging".to_string());
         }
+        let audio_count = audio_handles.len();
         inner.error_message = None;
         inner.state = RecordingState::Recording;
         inner.recording_start = Some(recording_start);
         inner.audio_start = audio_start;
         inner.filename = Some(filename.clone());
         inner.video_process = Some(video_proc);
-        inner.audio_processes = audio_procs;
-        inner.audio_device_names = audio_device_names;
+        inner.audio_handles = audio_handles;
+        inner.audio_device_count = audio_count;
         inner.webcam_process = webcam_proc;
         inner.has_webcam = has_webcam && inner.webcam_process.is_some();
 
@@ -891,8 +1070,8 @@ impl RecordingEngine {
     }
 
     async fn stop_recording(&self) {
-        // Take ownership of processes under lock, then kill outside lock
-        let (mut video, mut audios, mut webcam) = {
+        // Take ownership of processes/handles under lock, then stop outside lock
+        let (mut video, audio_handles, mut webcam) = {
             let mut inner = self.inner.lock().await;
             if inner.state != RecordingState::Recording {
                 return;
@@ -902,20 +1081,19 @@ impl RecordingEngine {
 
             (
                 inner.video_process.take(),
-                std::mem::take(&mut inner.audio_processes),
+                std::mem::take(&mut inner.audio_handles),
                 inner.webcam_process.take(),
             )
         };
 
-        // Kill/wait outside the lock to avoid blocking other tasks
+        // Stop cpal audio recordings (finalize WAV files)
         tokio::task::spawn_blocking(move || {
             if let Some(ref mut proc) = video {
                 let _ = proc.kill();
                 let _ = proc.wait();
             }
-            for proc in &mut audios {
-                let _ = proc.kill();
-                let _ = proc.wait();
+            for mut handle in audio_handles {
+                handle.stop();
             }
             if let Some(ref mut proc) = webcam {
                 let _ = proc.kill();
@@ -1028,21 +1206,21 @@ impl EngineRef {
             if crashed {
                 let stderr = read_log(&self.tmp_dir.join("ffmpeg_stderr.log"));
 
-                // Take processes out under lock, then kill outside
-                let (mut audios, mut webcam) = {
+                // Take handles out under lock, then stop outside
+                let (audio_handles, mut webcam) = {
                     let mut inner = self.inner.lock().await;
                     inner.error_message = Some(format!("FFmpeg crashed: {}", stderr));
                     inner.state = RecordingState::Idle;
                     self.notify(&inner);
                     (
-                        std::mem::take(&mut inner.audio_processes),
+                        std::mem::take(&mut inner.audio_handles),
                         inner.webcam_process.take(),
                     )
                 };
 
-                // Kill processes outside lock
-                for p in &mut audios {
-                    let _ = p.kill();
+                // Stop audio and kill webcam outside lock
+                for mut h in audio_handles {
+                    h.stop();
                 }
                 if let Some(ref mut p) = webcam {
                     let _ = p.kill();
@@ -1087,7 +1265,7 @@ impl EngineRef {
             0
         };
 
-        let audio_count = inner.audio_device_names.len();
+        let audio_count = inner.audio_device_count;
         let has_webcam = inner.has_webcam;
         drop(inner);
 
@@ -1543,11 +1721,7 @@ async fn api_update_settings(
 async fn api_devices(State(state): State<AppState>) -> Json<DevicesResponse> {
     let devs = state.engine.device_enumerator.lock().await.list_all();
     Json(DevicesResponse {
-        audio: devs
-            .microphone
-            .into_iter()
-            .map(|name| AudioDeviceInfo { name })
-            .collect(),
+        audio: devs.audio,
         webcam: devs.webcam,
     })
 }
@@ -1698,27 +1872,38 @@ async fn run_cli_mode(args: CliArgs) {
     // --list-devices
     if args.list_devices {
         let devs = engine.device_enumerator.lock().await.list_all();
-        println!("音频设备:");
-        if devs.microphone.is_empty() {
-            println!("  (未找到音频设备)");
+        let inputs: Vec<_> = devs.audio.iter().filter(|d| d.device_type == "input").collect();
+        let outputs: Vec<_> = devs.audio.iter().filter(|d| d.device_type == "output").collect();
+
+        println!("音频输入设备 (麦克风等):");
+        if inputs.is_empty() {
+            println!("  (未找到)");
         } else {
-            for mic in &devs.microphone {
-                println!("  {}", mic);
+            for dev in &inputs {
+                println!("  {}", dev.name);
+            }
+        }
+        println!();
+        println!("音频输出设备 (扬声器/耳机 - 可录制系统声音):");
+        if outputs.is_empty() {
+            println!("  (未找到)");
+        } else {
+            for dev in &outputs {
+                println!("  {}", dev.name);
             }
         }
         println!();
         println!("摄像头设备:");
         if devs.webcam.is_empty() {
-            println!("  (未找到摄像头设备)");
+            println!("  (未找到)");
         } else {
             for cam in &devs.webcam {
                 println!("  {}", cam);
             }
         }
         println!();
-        println!("提示: 若需录制系统音频 (扬声器输出)，请在 Windows 声音设置中");
-        println!("      启用\"立体声混音 (Stereo Mix)\"，然后选择该设备录制。");
-        println!("      同时选择麦克风和立体声混音可实现扬声器+麦克风同时录制。");
+        println!("提示: 选择\"输出设备\"可通过 WASAPI loopback 录制系统音频。");
+        println!("      同时选择输入+输出设备可实现麦克风+扬声器同时录制。");
         return;
     }
 
