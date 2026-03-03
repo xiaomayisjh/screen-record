@@ -370,6 +370,9 @@ fn build_audio_capture_cmd(
         ffmpeg.to_string_lossy().to_string(),
         "-f".to_string(),
         "dshow".to_string(),
+        // Use small buffer to reduce latency and avoid exclusive access on some drivers
+        "-audio_buffer_size".to_string(),
+        "50".to_string(),
         "-i".to_string(),
         format!("audio={}", device_name),
         "-ac".to_string(),
@@ -546,13 +549,7 @@ impl DeviceEnumerator {
                 let text = String::from_utf8_lossy(&out.stdout).to_string()
                     + &String::from_utf8_lossy(&out.stderr);
 
-                let cameras = parse_device_section(&text, None, Some("DirectShow audio"));
-                let microphones = parse_device_section(&text, Some("DirectShow audio"), None);
-
-                let result = DeviceList {
-                    webcam: cameras,
-                    microphone: microphones,
-                };
+                let result = parse_dshow_devices(&text);
                 self.cache = Some(result.clone());
                 self.cache_time = Instant::now();
                 result
@@ -565,38 +562,88 @@ impl DeviceEnumerator {
     }
 }
 
-fn parse_device_section(
-    output: &str,
-    start_marker: Option<&str>,
-    end_marker: Option<&str>,
-) -> Vec<String> {
-    let mut section = output.to_string();
-    if let Some(marker) = start_marker {
-        if let Some(idx) = section.find(marker) {
-            section = section[idx..].to_string();
-        } else {
-            return vec![];
-        }
-    }
-    if let Some(marker) = end_marker {
-        if let Some(idx) = section.find(marker) {
-            section = section[..idx].to_string();
-        }
-    }
+/// Parse FFmpeg dshow device listing output.
+///
+/// Supports both old format (section headers "DirectShow video/audio devices")
+/// and new FFmpeg 7.x format (per-line "(video)" / "(audio)" tags).
+fn parse_dshow_devices(output: &str) -> DeviceList {
+    let mut webcams = vec![];
+    let mut microphones = vec![];
 
-    let mut devices = vec![];
-    for line in section.lines() {
-        if let Some(bracket_end) = line.find(']') {
+    // Detect format: new FFmpeg 7.x uses per-line "(video)" / "(audio)" tags
+    let has_per_line_tags = output.lines().any(|l| {
+        let trimmed = l.trim();
+        trimmed.ends_with("(video)") || trimmed.ends_with("(audio)")
+    });
+
+    if has_per_line_tags {
+        // New format: each device line ends with (video) or (audio)
+        // [dshow @ ...] "Device Name" (video)
+        // [dshow @ ...] "Device Name" (audio)
+        for line in output.lines() {
+            let bracket_end = match line.find(']') {
+                Some(i) => i,
+                None => continue,
+            };
             let remainder = line[bracket_end + 1..].trim();
-            if remainder.starts_with('"') {
-                let name = remainder.trim_matches(|c: char| c == '"' || c == ' ');
-                if !name.is_empty() {
-                    devices.push(name.to_string());
-                }
+
+            let (name_part, dev_type) = if remainder.ends_with("(video)") {
+                (&remainder[..remainder.len() - 7], "video")
+            } else if remainder.ends_with("(audio)") {
+                (&remainder[..remainder.len() - 7], "audio")
+            } else {
+                continue;
+            };
+
+            let name = name_part.trim().trim_matches('"');
+            if name.is_empty() || name.starts_with("Alternative name") {
+                continue;
+            }
+
+            match dev_type {
+                "video" => webcams.push(name.to_string()),
+                "audio" => microphones.push(name.to_string()),
+                _ => {}
+            }
+        }
+    } else {
+        // Old format: section headers "DirectShow video devices" / "DirectShow audio devices"
+        let mut in_audio_section = false;
+        for line in output.lines() {
+            if line.contains("DirectShow audio") {
+                in_audio_section = true;
+                continue;
+            }
+            if line.contains("DirectShow video") {
+                in_audio_section = false;
+                continue;
+            }
+
+            let bracket_end = match line.find(']') {
+                Some(i) => i,
+                None => continue,
+            };
+            let remainder = line[bracket_end + 1..].trim();
+            if !remainder.starts_with('"') {
+                continue;
+            }
+            let name = remainder.trim_matches(|c: char| c == '"' || c == ' ');
+            if name.is_empty() {
+                continue;
+            }
+
+            if in_audio_section {
+                microphones.push(name.to_string());
+            } else {
+                webcams.push(name.to_string());
             }
         }
     }
-    devices
+
+    DeviceList {
+        webcam: webcams,
+        microphone: microphones,
+    }
 }
 
 // ============================================================
@@ -1653,7 +1700,7 @@ async fn run_cli_mode(args: CliArgs) {
         let devs = engine.device_enumerator.lock().await.list_all();
         println!("音频设备:");
         if devs.microphone.is_empty() {
-            println!("  (未找到音频输入设备)");
+            println!("  (未找到音频设备)");
         } else {
             for mic in &devs.microphone {
                 println!("  {}", mic);
@@ -1668,6 +1715,10 @@ async fn run_cli_mode(args: CliArgs) {
                 println!("  {}", cam);
             }
         }
+        println!();
+        println!("提示: 若需录制系统音频 (扬声器输出)，请在 Windows 声音设置中");
+        println!("      启用\"立体声混音 (Stereo Mix)\"，然后选择该设备录制。");
+        println!("      同时选择麦克风和立体声混音可实现扬声器+麦克风同时录制。");
         return;
     }
 
