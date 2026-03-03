@@ -3,36 +3,96 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Virtual environment
-.venv/
-venv/
-ENV/
-
-# Distribution / packaging
+.Python
+env/
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
 *.egg-info/
+.installed.cfg
 *.egg
 
-# FFmpeg binaries
+# Virtual Environment
+venv/
+ENV/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Recording files
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
+*.mp3
+*.wav
+*.aac
+*.m4a
+*.wma
+recordings/
+output/
+temp/
+ScreenCaptures/
+
+# FFmpeg related
+*.log
+ffmpeg.log
 ffmpeg.exe
 ffplay.exe
 ffprobe.exe
 
-# Runtime settings
+# Temporary files
+*.tmp
+*.temp
+~$*
+tmp/
+
+# Logs
+*.log
+
+# System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Project specific
+sr_settings.json
+config.json
 settings.json
 
-# Screen recordings output
-ScreenCaptures/
-
-# IDE / editor
-.vscode/
-.idea/
-
-# OS files
-Thumbs.db
-Desktop.ini
-
-# Temporary files
-tmp/
+# Rust
+/target/
+**/target/
+Cargo.lock
+# Keep Cargo.lock for binary projects, uncomment below if this is a library
+# !Cargo.lock
+*.rs.bk
