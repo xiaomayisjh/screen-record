@@ -2,6 +2,7 @@ import json
 import time
 import os
 from flask import jsonify, request, send_from_directory, Response
+from recorder.settings_manager import ENCODER_NAMES
 
 
 def register_api(app):
@@ -112,6 +113,27 @@ def register_api(app):
                 "Connection": "keep-alive",
             },
         )
+
+    @app.route("/api/encoders")
+    def api_available_encoders():
+        available = _settings().detect_available_encoders()
+        encoders_list = []
+        for enc in available:
+            encoders_list.append({
+                "id": enc,
+                "name": ENCODER_NAMES.get(enc, enc),
+                "is_hardware": enc in ("h264_nvenc", "h264_qsv", "h264_amf")
+            })
+        return jsonify({"encoders": encoders_list})
+
+    @app.route("/api/encoders/best")
+    def api_best_encoder():
+        best = _settings().get_best_encoder()
+        return jsonify({
+            "encoder": best,
+            "name": ENCODER_NAMES.get(best, best),
+            "is_hardware": best in ("h264_nvenc", "h264_qsv", "h264_amf")
+        })
 
     @app.route("/api/filename/next")
     def api_next_filename():

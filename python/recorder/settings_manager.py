@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import threading
 
 DEFAULT_SETTINGS = {
@@ -10,10 +11,27 @@ DEFAULT_SETTINGS = {
     "audio_devices": [],
 }
 
+SUPPORTED_ENCODERS = [
+    "h264_nvenc",
+    "h264_qsv",
+    "h264_amf",
+    "libx264",
+    "mpeg4",
+]
+
+ENCODER_NAMES = {
+    "h264_nvenc": "NVIDIA NVENC",
+    "h264_qsv": "Intel QuickSync",
+    "h264_amf": "AMD AMF",
+    "libx264": "H.264 (CPU)",
+    "mpeg4": "MPEG-4 (CPU)",
+}
+
 
 class SettingsManager:
     def __init__(self, base_dir):
         self._path = os.path.join(base_dir, "settings.json")
+        self._ffmpeg_path = os.path.join(base_dir, "ffmpeg.exe")
         self._lock = threading.Lock()
         self._settings = dict(DEFAULT_SETTINGS)
         self._load()
@@ -47,7 +65,7 @@ class SettingsManager:
                     self._settings["fps"] = max(1, min(120, fps))
                 except (ValueError, TypeError):
                     pass
-            if "encoder" in changes and changes["encoder"] in ("mpeg4", "h264_nvenc"):
+            if "encoder" in changes and changes["encoder"] in SUPPORTED_ENCODERS:
                 self._settings["encoder"] = changes["encoder"]
             if "draw_mouse" in changes:
                 self._settings["draw_mouse"] = bool(changes["draw_mouse"])
@@ -60,3 +78,39 @@ class SettingsManager:
                 ]
             self._save()
         return self.get_all()
+
+    def detect_available_encoders(self):
+        if not os.path.exists(self._ffmpeg_path):
+            return ["mpeg4"]
+
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            result = subprocess.run(
+                [self._ffmpeg_path, "-encoders"],
+                capture_output=True,
+                text=True,
+                startupinfo=startupinfo,
+                timeout=10,
+            )
+            output = result.stdout + result.stderr
+        except Exception:
+            return ["mpeg4"]
+
+        available = ["mpeg4"]
+        for encoder in SUPPORTED_ENCODERS:
+            if encoder == "mpeg4":
+                continue
+            if encoder in output:
+                available.append(encoder)
+
+        return available
+
+    def get_best_encoder(self):
+        available = self.detect_available_encoders()
+        for encoder in SUPPORTED_ENCODERS:
+            if encoder in available:
+                return encoder
+        return "mpeg4"

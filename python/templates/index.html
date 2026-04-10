@@ -187,19 +187,22 @@
 
                     <!-- Encoder -->
                     <div>
-                        <span class="text-sm block mb-2">Encoder</span>
-                        <div class="flex gap-2">
-                            <button id="enc-cpu" data-encoder="mpeg4"
-                                class="flex-1 py-2 px-3 rounded-lg text-xs font-medium transition-colors duration-200
-                                       cursor-pointer bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                                CPU (mpeg4)
-                            </button>
-                            <button id="enc-nvenc" data-encoder="h264_nvenc"
-                                class="flex-1 py-2 px-3 rounded-lg text-xs font-medium transition-colors duration-200
-                                       cursor-pointer bg-slate-700 text-slate-400 border border-slate-600 hover:bg-slate-650">
-                                NVENC (GPU)
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-sm">Encoder</span>
+                            <button id="btn-detect-encoder"
+                                class="text-xs text-blue-400 hover:text-blue-300 transition-colors duration-200 cursor-pointer">
+                                Auto Detect
                             </button>
                         </div>
+                        <div class="flex gap-2">
+                            <select id="encoder-select"
+                                class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm
+                                       text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50
+                                       cursor-pointer appearance-none">
+                                <option value="mpeg4">MPEG-4 (CPU)</option>
+                            </select>
+                        </div>
+                        <p id="encoder-status" class="text-xs text-slate-500 mt-1"></p>
                     </div>
 
                     <!-- Draw mouse -->
