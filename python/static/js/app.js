@@ -407,14 +407,14 @@ const App = {
             this.debounceSaveSettings();
         });
 
-        // Encoder toggle
-        document.getElementById('enc-cpu').addEventListener('click', () => {
-            this.setEncoder('mpeg4');
+        // Encoder select
+        document.getElementById('encoder-select').addEventListener('change', () => {
             this.debounceSaveSettings();
         });
-        document.getElementById('enc-nvenc').addEventListener('click', () => {
-            this.setEncoder('h264_nvenc');
-            this.debounceSaveSettings();
+
+        // Auto detect button
+        document.getElementById('btn-detect-encoder').addEventListener('click', () => {
+            this.detectBestEncoder();
         });
 
         // Draw mouse toggle
@@ -440,17 +440,47 @@ const App = {
         });
     },
 
-    setEncoder(encoder) {
-        const cpuBtn = document.getElementById('enc-cpu');
-        const nvBtn = document.getElementById('enc-nvenc');
-        const activeClass = 'bg-blue-500/20 text-blue-400 border-blue-500/30';
-        const inactiveClass = 'bg-slate-700 text-slate-400 border-slate-600';
+    async loadEncoders() {
+        try {
+            const res = await fetch('/api/encoders');
+            const data = await res.json();
+            const select = document.getElementById('encoder-select');
+            select.innerHTML = data.encoders.map(enc =>
+                `<option value="${this.escapeHtml(enc.id)}">${this.escapeHtml(enc.name)}${enc.is_hardware ? ' (Hardware)' : ''}</option>`
+            ).join('');
+        } catch (err) {
+            console.error('Failed to load encoders:', err);
+        }
+    },
 
-        [cpuBtn, nvBtn].forEach(btn => {
-            const isActive = btn.dataset.encoder === encoder;
-            activeClass.split(' ').forEach(c => btn.classList.toggle(c, isActive));
-            inactiveClass.split(' ').forEach(c => btn.classList.toggle(c, !isActive));
-        });
+    async detectBestEncoder() {
+        const btn = document.getElementById('btn-detect-encoder');
+        const status = document.getElementById('encoder-status');
+        const originalText = btn.textContent;
+        
+        btn.textContent = 'Detecting...';
+        btn.disabled = true;
+        status.textContent = '';
+
+        try {
+            const res = await fetch('/api/encoders/best');
+            const data = await res.json();
+            
+            const select = document.getElementById('encoder-select');
+            select.value = data.encoder;
+            
+            status.textContent = `Selected: ${data.name}${data.is_hardware ? ' (Hardware)' : ''}`;
+            status.className = 'text-xs text-green-400 mt-1';
+            
+            this.debounceSaveSettings();
+        } catch (err) {
+            status.textContent = 'Failed to detect encoder';
+            status.className = 'text-xs text-red-400 mt-1';
+            console.error('Failed to detect encoder:', err);
+        } finally {
+            btn.textContent = originalText;
+            btn.disabled = false;
+        }
     },
 
     setAudioMode(mode) {
@@ -477,7 +507,7 @@ const App = {
     async saveSettings() {
         const settings = {
             fps: parseInt(document.getElementById('fps-slider').value),
-            encoder: document.querySelector('#enc-cpu.bg-blue-500\\/20') ? 'mpeg4' : 'h264_nvenc',
+            encoder: document.getElementById('encoder-select').value,
             draw_mouse: document.getElementById('toggle-mouse').classList.contains('active'),
             audio_mode: document.querySelector('#audio-default.bg-blue-500\\/20') ? 'default' : 'selected',
             audio_devices: this.getSelectedAudioDevices(),
@@ -498,12 +528,18 @@ const App = {
 
     async loadSettings() {
         try {
+            await this.loadEncoders();
+            
             const res = await fetch('/api/settings');
             this.settings = await res.json();
 
             document.getElementById('fps-slider').value = this.settings.fps || 30;
             document.getElementById('fps-value').textContent = (this.settings.fps || 30) + ' fps';
-            this.setEncoder(this.settings.encoder || 'mpeg4');
+            
+            const encoderSelect = document.getElementById('encoder-select');
+            if (encoderSelect.querySelector(`option[value="${this.settings.encoder}"]`)) {
+                encoderSelect.value = this.settings.encoder || 'mpeg4';
+            }
 
             const mouseToggle = document.getElementById('toggle-mouse');
             mouseToggle.classList.toggle('active', this.settings.draw_mouse !== false);

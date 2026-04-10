@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="theme-color" content="#0f172a">
-    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="robots" content="noindex, nofollow">
     <title>Screen Recorder</title>
@@ -187,19 +187,22 @@
 
                     <!-- Encoder -->
                     <div>
-                        <span class="text-sm block mb-2">Encoder</span>
-                        <div class="flex gap-2">
-                            <button id="enc-cpu" data-encoder="mpeg4"
-                                class="flex-1 py-2 px-3 rounded-lg text-xs font-medium transition-colors duration-200
-                                       cursor-pointer bg-blue-500/20 text-blue-400 border border-blue-500/30">
-                                CPU (mpeg4)
-                            </button>
-                            <button id="enc-nvenc" data-encoder="h264_nvenc"
-                                class="flex-1 py-2 px-3 rounded-lg text-xs font-medium transition-colors duration-200
-                                       cursor-pointer bg-slate-700 text-slate-400 border border-slate-600 hover:bg-slate-650">
-                                NVENC (GPU)
+                        <div class="flex items-center justify-between mb-2">
+                            <span class="text-sm">Encoder</span>
+                            <button id="btn-detect-encoder"
+                                class="text-xs text-blue-400 hover:text-blue-300 transition-colors duration-200 cursor-pointer">
+                                Auto Detect
                             </button>
                         </div>
+                        <div class="flex gap-2">
+                            <select id="encoder-select"
+                                class="flex-1 bg-slate-700 border border-slate-600 rounded-lg px-3 py-2 text-sm
+                                       text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50
+                                       cursor-pointer appearance-none">
+                                <option value="mpeg4">MPEG-4 (CPU)</option>
+                            </select>
+                        </div>
+                        <p id="encoder-status" class="text-xs text-slate-500 mt-1"></p>
                     </div>
 
                     <!-- Draw mouse -->
@@ -267,7 +270,7 @@
                        min-h-[44px] transition-colors duration-200 text-slate-500"
                 data-panel="settings" aria-label="Settings">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                <path d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 001.066-2.573c-.426 1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
                 <circle cx="12" cy="12" r="3"/>
             </svg>
             <span class="text-[10px] mt-0.5 font-medium">Settings</span>

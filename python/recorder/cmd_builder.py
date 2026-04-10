@@ -41,14 +41,24 @@ class CmdBuilder:
         else:
             self.source = "title=" + window_name
 
+    def _add_encoder_params(self, cmd):
+        cmd.extend(["-c:v", self.encoder])
+        
+        if self.encoder == "mpeg4":
+            cmd.extend(["-q:v", "7"])
+        elif self.encoder == "libx264":
+            cmd.extend(["-preset", "fast", "-crf", "23"])
+        elif self.encoder in ("h264_nvenc", "h264_qsv", "h264_amf"):
+            cmd.extend(["-preset", "fast"])
+
     def get_capture_cmd(self, filename):
         cmd = [self.ffmpeg, "-f", "gdigrab"]
         cmd.extend(["-framerate", str(self.fps)])
         cmd.extend(["-draw_mouse", str(self.draw_mouse)])
         cmd.extend(["-i", self.source])
-        cmd.extend(["-c:v", self.encoder])
-        if self.encoder == "mpeg4":
-            cmd.extend(["-q:v", "7"])
+        
+        self._add_encoder_params(cmd)
+        
         if self.hwaccel:
             cmd.extend(["-hwaccel", self.hwaccel])
         cmd.extend(["-y", filename])
@@ -95,8 +105,8 @@ class CmdBuilder:
             cmd.extend(["-hwaccel", self.hwaccel])
         # Copy video stream directly (no re-encoding) unless webcam overlay requires it
         if not self.enable_webcam:
-            if self.encoder == "h264_nvenc":
-                cmd.extend(["-c:v", self.encoder])
+            if self.encoder in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+                self._add_encoder_params(cmd)
             else:
                 cmd.extend(["-c:v", "copy"])
         cmd.extend(["-shortest"])

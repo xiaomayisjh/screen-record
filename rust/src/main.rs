@@ -47,6 +47,48 @@ const EMBEDDED_FFMPEG: &[u8] = include_bytes!(env!("FFMPEG_EMBED_PATH"));
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+const SUPPORTED_ENCODERS: &[&str] = &[
+    "h264_nvenc",
+    "h264_qsv", 
+    "h264_amf",
+    "libx264",
+    "mpeg4",
+];
+
+fn get_encoder_name(encoder: &str) -> &str {
+    match encoder {
+        "h264_nvenc" => "NVIDIA NVENC",
+        "h264_qsv" => "Intel QuickSync",
+        "h264_amf" => "AMD AMF",
+        "libx264" => "H.264 (CPU)",
+        "mpeg4" => "MPEG-4 (CPU)",
+        _ => encoder,
+    }
+}
+
+fn is_hardware_encoder(encoder: &str) -> bool {
+    matches!(encoder, "h264_nvenc" | "h264_qsv" | "h264_amf")
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EncoderInfo {
+    id: String,
+    name: String,
+    is_hardware: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EncodersResponse {
+    encoders: Vec<EncoderInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BestEncoderResponse {
+    encoder: String,
+    name: String,
+    is_hardware: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum RecordingState {
@@ -162,14 +204,16 @@ struct FilenameResponse {
 
 struct SettingsManager {
     path: PathBuf,
+    ffmpeg_path: PathBuf,
     settings: Settings,
 }
 
 impl SettingsManager {
-    fn new(base_dir: &Path) -> Self {
+    fn new(base_dir: &Path, ffmpeg_path: PathBuf) -> Self {
         let path = base_dir.join("settings.json");
         let mut mgr = Self {
             path,
+            ffmpeg_path,
             settings: Settings::default(),
         };
         mgr.load();
@@ -184,7 +228,7 @@ impl SettingsManager {
                         self.settings.fps = fps.clamp(1, 120) as u32;
                     }
                     if let Some(enc) = saved.get("encoder").and_then(|v| v.as_str()) {
-                        if enc == "mpeg4" || enc == "h264_nvenc" {
+                        if SUPPORTED_ENCODERS.contains(&enc) {
                             self.settings.encoder = enc.to_string();
                         }
                     }
@@ -222,7 +266,7 @@ impl SettingsManager {
             self.settings.fps = fps.clamp(1, 120) as u32;
         }
         if let Some(enc) = changes.get("encoder").and_then(|v| v.as_str()) {
-            if enc == "mpeg4" || enc == "h264_nvenc" {
+            if SUPPORTED_ENCODERS.contains(&enc) {
                 self.settings.encoder = enc.to_string();
             }
         }
@@ -242,6 +286,52 @@ impl SettingsManager {
         }
         self.save();
         self.settings.clone()
+    }
+
+    fn detect_available_encoders(&self) -> Vec<String> {
+        let mut available = vec!["mpeg4".to_string()];
+        
+        if !self.ffmpeg_path.exists() {
+            return available;
+        }
+
+        let output = Command::new(&self.ffmpeg_path)
+            .arg("-encoders")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(windows)]
+        let output = output.creation_flags(CREATE_NO_WINDOW);
+
+        let output = match output.output() {
+            Ok(o) => o,
+            Err(_) => return available,
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = stdout.to_string() + &stderr;
+
+        for &encoder in SUPPORTED_ENCODERS {
+            if encoder == "mpeg4" {
+                continue;
+            }
+            if combined.contains(encoder) {
+                available.push(encoder.to_string());
+            }
+        }
+
+        available
+    }
+
+    fn get_best_encoder(&self) -> String {
+        let available = self.detect_available_encoders();
+        for &encoder in SUPPORTED_ENCODERS {
+            if available.contains(&encoder.to_string()) {
+                return encoder.to_string();
+            }
+        }
+        "mpeg4".to_string()
     }
 }
 
@@ -354,12 +444,24 @@ fn build_capture_cmd(
         if settings.draw_mouse { "1" } else { "0" }.to_string(),
         "-i".to_string(),
         source.to_string(),
-        "-c:v".to_string(),
-        settings.encoder.clone(),
     ];
-    if settings.encoder == "mpeg4" {
-        cmd.extend(["-q:v".to_string(), "7".to_string()]);
+    
+    cmd.extend(["-c:v".to_string(), settings.encoder.clone()]);
+    
+    match settings.encoder.as_str() {
+        "mpeg4" => {
+            cmd.extend(["-q:v".to_string(), "7".to_string()]);
+        }
+        "libx264" => {
+            cmd.extend(["-preset".to_string(), "fast".to_string()]);
+            cmd.extend(["-crf".to_string(), "23".to_string()]);
+        }
+        "h264_nvenc" | "h264_qsv" | "h264_amf" => {
+            cmd.extend(["-preset".to_string(), "fast".to_string()]);
+        }
+        _ => {}
     }
+    
     cmd.extend(["-y".to_string(), tmp_video.to_string_lossy().to_string()]);
     cmd
 }
@@ -638,10 +740,19 @@ fn build_merge_cmd(
 
     // Video codec
     if !has_webcam {
-        if encoder == "h264_nvenc" {
-            cmd.extend(["-c:v".to_string(), encoder.to_string()]);
-        } else {
-            cmd.extend(["-c:v".to_string(), "copy".to_string()]);
+        match encoder {
+            "h264_nvenc" | "h264_qsv" | "h264_amf" | "libx264" => {
+                cmd.extend(["-c:v".to_string(), encoder.to_string()]);
+                if encoder == "libx264" {
+                    cmd.extend(["-preset".to_string(), "fast".to_string()]);
+                    cmd.extend(["-crf".to_string(), "23".to_string()]);
+                } else {
+                    cmd.extend(["-preset".to_string(), "fast".to_string()]);
+                }
+            }
+            _ => {
+                cmd.extend(["-c:v".to_string(), "copy".to_string()]);
+            }
         }
     }
 
@@ -1484,8 +1595,8 @@ struct CliArgs {
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=120))]
     fps: Option<u32>,
 
-    /// Encoder: mpeg4 (CPU) or h264_nvenc (GPU)
-    #[arg(long, value_parser = ["mpeg4", "h264_nvenc"])]
+    /// Encoder: mpeg4 (CPU), h264_nvenc (NVIDIA), h264_qsv (Intel), h264_amf (AMD), or libx264 (H.264 CPU)
+    #[arg(long, value_parser = ["mpeg4", "h264_nvenc", "h264_qsv", "h264_amf", "libx264"])]
     encoder: Option<String>,
 
     /// Do not draw mouse cursor
@@ -1770,6 +1881,28 @@ async fn api_next_filename(State(state): State<AppState>) -> Json<FilenameRespon
     })
 }
 
+async fn api_available_encoders(State(state): State<AppState>) -> Json<EncodersResponse> {
+    let available = state.engine.settings.lock().await.detect_available_encoders();
+    let encoders = available
+        .into_iter()
+        .map(|id| EncoderInfo {
+            id: id.clone(),
+            name: get_encoder_name(&id).to_string(),
+            is_hardware: is_hardware_encoder(&id),
+        })
+        .collect();
+    Json(EncodersResponse { encoders })
+}
+
+async fn api_best_encoder(State(state): State<AppState>) -> Json<BestEncoderResponse> {
+    let best = state.engine.settings.lock().await.get_best_encoder();
+    Json(BestEncoderResponse {
+        encoder: best.clone(),
+        name: get_encoder_name(&best).to_string(),
+        is_hardware: is_hardware_encoder(&best),
+    })
+}
+
 // ============================================================
 // SECTION 11: Web Server Setup
 // ============================================================
@@ -1795,6 +1928,8 @@ fn create_router(state: AppState) -> Router {
         .route("/api/devices", get(api_devices))
         .route("/api/events", get(api_events))
         .route("/api/filename/next", get(api_next_filename))
+        .route("/api/encoders", get(api_available_encoders))
+        .route("/api/encoders/best", get(api_best_encoder))
         .with_state(state)
 }
 
@@ -1812,9 +1947,9 @@ async fn run_cli_mode(args: CliArgs) {
 
     // Load settings
     let settings = if let Some(ref config_path) = args.config {
-        SettingsManager::new(config_path.parent().unwrap_or(Path::new(".")))
+        SettingsManager::new(config_path.parent().unwrap_or(Path::new(".")), ffmpeg_path.clone())
     } else {
-        SettingsManager::new(&base_dir)
+        SettingsManager::new(&base_dir, ffmpeg_path.clone())
     };
 
     // Apply CLI overrides
@@ -2235,7 +2370,7 @@ async fn main() {
         let ffmpeg_path = find_ffmpeg(&base_dir, args.ffmpeg_path.as_deref())
             .expect("ffmpeg.exe not found. Place it beside the executable or use --ffmpeg-path");
 
-        let settings = Arc::new(Mutex::new(SettingsManager::new(&base_dir)));
+        let settings = Arc::new(Mutex::new(SettingsManager::new(&base_dir, ffmpeg_path.clone())));
         let engine = Arc::new(RecordingEngine::new(base_dir, settings, ffmpeg_path));
 
         let state = AppState {
