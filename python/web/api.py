@@ -2,7 +2,7 @@ import json
 import time
 import os
 from flask import jsonify, request, send_from_directory, Response
-from recorder.settings_manager import ENCODER_NAMES
+from recorder.settings_manager import ENCODER_NAMES, HWACCEL_NAMES, ENCODER_HWACCEL_MAP
 
 
 def register_api(app):
@@ -117,23 +117,44 @@ def register_api(app):
     @app.route("/api/encoders")
     def api_available_encoders():
         available = _settings().detect_available_encoders()
+        available_hwaccels = _settings().detect_available_hwaccels()
         encoders_list = []
         for enc in available:
+            hwaccel = ENCODER_HWACCEL_MAP.get(enc)
             encoders_list.append({
                 "id": enc,
                 "name": ENCODER_NAMES.get(enc, enc),
-                "is_hardware": enc in ("h264_nvenc", "h264_qsv", "h264_amf")
+                "is_hardware": enc in ENCODER_HWACCEL_MAP,
+                "hwaccel": hwaccel,
+                "hwaccel_available": hwaccel in available_hwaccels if hwaccel else None,
             })
         return jsonify({"encoders": encoders_list})
 
     @app.route("/api/encoders/best")
     def api_best_encoder():
         best = _settings().get_best_encoder()
+        hwaccel = ENCODER_HWACCEL_MAP.get(best)
         return jsonify({
             "encoder": best,
             "name": ENCODER_NAMES.get(best, best),
-            "is_hardware": best in ("h264_nvenc", "h264_qsv", "h264_amf")
+            "is_hardware": best in ENCODER_HWACCEL_MAP,
+            "hwaccel": hwaccel,
+            "hwaccel_name": HWACCEL_NAMES.get(hwaccel) if hwaccel else None,
         })
+
+    @app.route("/api/hwaccels")
+    def api_available_hwaccels():
+        available = _settings().detect_available_hwaccels()
+        hwaccels_list = []
+        for hw in available:
+            hwaccels_list.append({
+                "id": hw,
+                "name": HWACCEL_NAMES.get(hw, hw),
+                "compatible_encoders": [
+                    enc for enc, hwa in ENCODER_HWACCEL_MAP.items() if hwa == hw
+                ],
+            })
+        return jsonify({"hwaccels": hwaccels_list})
 
     @app.route("/api/filename/next")
     def api_next_filename():

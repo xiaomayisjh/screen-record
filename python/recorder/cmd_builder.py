@@ -1,5 +1,20 @@
 import os
 
+ENCODER_HWACCEL_MAP = {
+    "h264_qsv": "qsv",
+    "h264_amf": "d3d11va",
+    "h264_nvenc": "cuda",
+}
+
+FALLBACK_ENCODER = {
+    "h264_qsv": "libx264",
+    "h264_amf": "libx264",
+    "h264_nvenc": "libx264",
+    "libx264": "mpeg4",
+}
+
+HW_ENCODERS = set(ENCODER_HWACCEL_MAP.keys())
+
 
 class CmdBuilder:
     def __init__(self, base_dir):
@@ -24,6 +39,7 @@ class CmdBuilder:
             self.source = source
         if encoder is not None:
             self.encoder = encoder
+            self.hwaccel = ENCODER_HWACCEL_MAP.get(encoder)
         if hwaccel != "unchanged":
             self.hwaccel = hwaccel
         if draw_mouse is not None:
@@ -43,29 +59,36 @@ class CmdBuilder:
 
     def _add_encoder_params(self, cmd):
         cmd.extend(["-c:v", self.encoder])
-        
+
         if self.encoder == "mpeg4":
             cmd.extend(["-q:v", "7"])
         elif self.encoder == "libx264":
             cmd.extend(["-preset", "fast", "-crf", "23"])
-        elif self.encoder in ("h264_nvenc", "h264_qsv", "h264_amf"):
+        elif self.encoder in HW_ENCODERS:
             cmd.extend(["-preset", "fast"])
 
+    def _add_hwaccel_params(self, cmd):
+        if self.hwaccel:
+            cmd.extend(["-hwaccel", self.hwaccel])
+            if self.hwaccel == "qsv":
+                cmd.extend(["-hwaccel_output_format", "qsv"])
+
     def get_capture_cmd(self, filename):
-        cmd = [self.ffmpeg, "-f", "gdigrab"]
+        cmd = [self.ffmpeg]
+        self._add_hwaccel_params(cmd)
+        cmd.extend(["-f", "gdigrab"])
         cmd.extend(["-framerate", str(self.fps)])
         cmd.extend(["-draw_mouse", str(self.draw_mouse)])
         cmd.extend(["-i", self.source])
-        
+
         self._add_encoder_params(cmd)
-        
-        if self.hwaccel:
-            cmd.extend(["-hwaccel", self.hwaccel])
+
         cmd.extend(["-y", filename])
         return cmd
 
     def get_merge_cmd(self, filename):
         cmd = [self.ffmpeg]
+        self._add_hwaccel_params(cmd)
         cmd.extend(["-i", os.path.join(self.tmp_dir, "tmp.mkv")])
         for i in range(len(self.aud_list)):
             cmd.extend(["-i", os.path.join(self.tmp_dir, f"tmp_{i}.wav")])
@@ -101,14 +124,17 @@ class CmdBuilder:
                 "-vf", "[2:v] scale=640:-1 [inner]; [0:0][inner] overlay=0:0 [out]",
                 "-map", "[out]",
             ])
-        if self.hwaccel:
-            cmd.extend(["-hwaccel", self.hwaccel])
-        # Copy video stream directly (no re-encoding) unless webcam overlay requires it
         if not self.enable_webcam:
-            if self.encoder in ("h264_nvenc", "h264_qsv", "h264_amf", "libx264"):
+            if self.encoder in HW_ENCODERS or self.encoder == "libx264":
                 self._add_encoder_params(cmd)
             else:
                 cmd.extend(["-c:v", "copy"])
         cmd.extend(["-shortest"])
         cmd.extend(["-y", filename])
         return cmd
+
+    def get_fallback_encoder(self):
+        return FALLBACK_ENCODER.get(self.encoder)
+
+    def is_hardware_encoder(self):
+        return self.encoder in HW_ENCODERS
