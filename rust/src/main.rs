@@ -428,11 +428,57 @@ fn extract_embedded_ffmpeg() -> Option<PathBuf> {
 // SECTION 5: Command Builder
 // ============================================================
 
+/// Encoder fallback order (priority from high to low)
+const ENCODER_FALLBACK_ORDER: &[&str] = &[
+    "h264_nvenc",  // NVIDIA (best priority)
+    "h264_qsv",    // Intel QuickSync
+    "h264_amf",    // AMD AMF
+    "libx264",     // H.264 software
+    "mpeg4",       // MPEG-4 software (fallback)
+];
+
+/// Test if an encoder works with FFmpeg
+fn test_encoder(ffmpeg: &Path, encoder: &str) -> bool {
+    let output = Command::new(ffmpeg)
+        .args(["-f", "lavfi", "-i", "color=black:s=128x128:r=1:d=1",
+               "-c:v", encoder, "-t", "1", "-f", "null", "-"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false
+    }
+}
+
+/// Get a working encoder, trying fallback order if primary fails
+fn get_working_encoder(ffmpeg: &Path, preferred_encoder: &str, available_encoders: &[String]) -> String {
+    // First try the preferred encoder if available
+    if available_encoders.contains(&preferred_encoder.to_string()) && test_encoder(ffmpeg, preferred_encoder) {
+        return preferred_encoder.to_string();
+    }
+    
+    // Fall back to next available in priority order
+    for &encoder in ENCODER_FALLBACK_ORDER {
+        if available_encoders.contains(&encoder.to_string()) && test_encoder(ffmpeg, encoder) {
+            tracing::info!("Using encoder '{}' as fallback", encoder);
+            return encoder.to_string();
+        }
+    }
+    
+    // Last resort: always use mpeg4 which should always work
+    tracing::warn!("No hardware encoders available, falling back to mpeg4");
+    "mpeg4".to_string()
+}
+
 fn build_capture_cmd(
     ffmpeg: &Path,
     settings: &Settings,
     source: &str,
     tmp_video: &Path,
+    encoder: &str,
 ) -> Vec<String> {
     let mut cmd = vec![
         ffmpeg.to_string_lossy().to_string(),
@@ -446,9 +492,9 @@ fn build_capture_cmd(
         source.to_string(),
     ];
     
-    cmd.extend(["-c:v".to_string(), settings.encoder.clone()]);
+    cmd.extend(["-c:v".to_string(), encoder.to_string()]);
     
-    match settings.encoder.as_str() {
+    match encoder {
         "mpeg4" => {
             cmd.extend(["-q:v".to_string(), "7".to_string()]);
         }
@@ -456,8 +502,16 @@ fn build_capture_cmd(
             cmd.extend(["-preset".to_string(), "fast".to_string()]);
             cmd.extend(["-crf".to_string(), "23".to_string()]);
         }
-        "h264_nvenc" | "h264_qsv" | "h264_amf" => {
-            cmd.extend(["-preset".to_string(), "fast".to_string()]);
+        "h264_nvenc" => {
+            cmd.extend(["-preset".to_string(), "p1".to_string()]);  // p1 is fastest NVENC preset
+            cmd.extend(["-rc".to_string(), "constqp".to_string()]);
+        }
+        "h264_qsv" => {
+            cmd.extend(["-preset".to_string(), "veryfast".to_string()]);
+        }
+        "h264_amf" => {
+            cmd.extend(["-usage".to_string(), "transcoding".to_string()]);
+            cmd.extend(["-quality".to_string(), "speed".to_string()]);
         }
         _ => {}
     }
