@@ -185,6 +185,52 @@ class TestCmdBuilder(unittest.TestCase):
         self.builder.config(encoder="mpeg4", hwaccel="d3d11va")
         self.assertEqual(self.builder.hwaccel, "d3d11va")
 
+    def test_capture_cmd_includes_movflags(self):
+        self.builder.config(encoder="mpeg4")
+        cmd = self.builder.get_capture_cmd("out.mp4")
+        self.assertIn("-movflags", cmd)
+        movflags_idx = cmd.index("-movflags")
+        self.assertIn("frag_keyframe", cmd[movflags_idx + 1])
+        self.assertIn("empty_moov", cmd[movflags_idx + 1])
+
+    def test_capture_cmd_includes_flush_packets(self):
+        self.builder.config(encoder="mpeg4")
+        cmd = self.builder.get_capture_cmd("out.mp4")
+        self.assertIn("-flush_packets", cmd)
+        flush_idx = cmd.index("-flush_packets")
+        self.assertEqual(cmd[flush_idx + 1], "1")
+
+    def test_get_remux_cmd(self):
+        self.builder.config(encoder="mpeg4")
+        cmd = self.builder.get_remux_cmd("input.mp4", "output.mp4")
+        self.assertIn("-movflags", cmd)
+        self.assertIn("+faststart", cmd)
+        self.assertIn("-c:v", cmd)
+        self.assertIn("copy", cmd)
+        self.assertIn("input.mp4", cmd)
+        self.assertIn("output.mp4", cmd)
+
+    def test_get_merge_cmd_uses_copy_without_webcam(self):
+        self.builder.config(encoder="h264_qsv")
+        self.builder.aud_list = [None]
+        cmd = self.builder.get_merge_cmd("out.mp4")
+        cv_idx = cmd.index("-c:v")
+        self.assertEqual(cmd[cv_idx + 1], "copy")
+
+    def test_get_merge_cmd_reencodes_with_webcam(self):
+        self.builder.config(encoder="h264_qsv", webcam=True)
+        self.builder.aud_list = [None]
+        cmd = self.builder.get_merge_cmd("out.mp4")
+        self.assertIn("h264_qsv", cmd)
+
+    def test_merge_cmd_includes_faststart(self):
+        self.builder.config(encoder="mpeg4")
+        self.builder.aud_list = []
+        cmd = self.builder.get_merge_cmd("out.mp4")
+        self.assertIn("-movflags", cmd)
+        movflags_idx = cmd.index("-movflags")
+        self.assertIn("+faststart", cmd[movflags_idx + 1])
+
     def test_hwaccel_unchanged_preserves_auto(self):
         self.builder.config(encoder="h264_qsv")
         self.assertEqual(self.builder.hwaccel, "qsv")

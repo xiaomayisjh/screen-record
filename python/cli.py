@@ -88,6 +88,14 @@ def parse_args(argv=None):
                       help="从 JSON 配置文件读取设置 (如 settings.json)")
     conf.add_argument("--list-devices", action="store_true",
                       help="列出可用的音频和摄像头设备后退出")
+    conf.add_argument("--repair", action="store_true",
+                      help="扫描并修复所有损坏的录制文件后退出")
+    conf.add_argument("--repair-file", metavar="FILE", default=None,
+                      help="修复指定的录制文件后退出")
+    conf.add_argument("--check-files", action="store_true",
+                      help="检查所有录制文件的健康状态后退出")
+    conf.add_argument("--json", action="store_true",
+                      help="以 JSON 格式输出结果 (方便脚本解析)")
 
     args = p.parse_args(argv)
 
@@ -428,7 +436,68 @@ def main():
         _cleanup(engine, tmp_settings_dir)
         sys.exit(0)
 
-    # Check FFmpeg
+    if args.repair:
+        from recorder.repair import FileHealthChecker
+        checker = FileHealthChecker(
+            os.path.join(base_dir, "ffmpeg.exe"),
+            engine.captures_dir,
+        )
+        result = checker.repair_all()
+        if args.json:
+            import json as _json
+            print(_json.dumps(result.to_dict(), ensure_ascii=False))
+        else:
+            if result.repaired:
+                print("已修复:")
+                for name in result.repaired:
+                    print(f"  ✓ {name}")
+            if result.failed:
+                print("修复失败:")
+                for item in result.failed:
+                    print(f"  ✗ {item['name']}: {item['error']}")
+            if result.healthy:
+                print(f"健康文件: {len(result.healthy)} 个")
+        _cleanup(engine, tmp_settings_dir)
+        sys.exit(0 if not result.failed else 1)
+
+    if args.repair_file:
+        from recorder.repair import FileHealthChecker
+        checker = FileHealthChecker(
+            os.path.join(base_dir, "ffmpeg.exe"),
+            engine.captures_dir,
+        )
+        success, error = checker.repair_file(args.repair_file)
+        if args.json:
+            import json as _json
+            print(_json.dumps({"ok": success, "name": args.repair_file, "error": error}, ensure_ascii=False))
+        else:
+            if success:
+                print(f"已修复: {args.repair_file}")
+            else:
+                print(f"修复失败: {args.repair_file} — {error}", file=sys.stderr)
+        _cleanup(engine, tmp_settings_dir)
+        sys.exit(0 if success else 1)
+
+    if args.check_files:
+        from recorder.repair import FileHealthChecker
+        checker = FileHealthChecker(
+            os.path.join(base_dir, "ffmpeg.exe"),
+            engine.captures_dir,
+        )
+        health_map = checker.check_all_files()
+        if args.json:
+            import json as _json
+            print(_json.dumps({k: v.value for k, v in health_map.items()}, ensure_ascii=False))
+        else:
+            if not health_map:
+                print("没有录制文件")
+            else:
+                for name, health in health_map.items():
+                    icon = {"healthy": "✓", "fragmented": "⚠", "broken": "✗"}.get(health.value, "?")
+                    print(f"  {icon} {name} ({health.value})")
+        _cleanup(engine, tmp_settings_dir)
+        sys.exit(0)
+
     if not engine.has_ffmpeg():
         print("错误: 未找到 ffmpeg.exe，请将 ffmpeg.exe 放在项目根目录", file=sys.stderr)
         _cleanup(engine, tmp_settings_dir)

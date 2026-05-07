@@ -328,6 +328,11 @@ const App = {
             }
 
             empty.classList.add('hidden');
+            const healthIcon = {
+                'healthy': '<span class="text-green-400">✓</span>',
+                'fragmented': '<span class="text-amber-400">⚠</span>',
+                'broken': '<span class="text-red-400">✗</span>',
+            };
             list.innerHTML = this.files.map(f => `
                 <div class="file-item flex items-center gap-3 bg-slate-800 rounded-xl p-4" data-name="${this.escapeHtml(f.name)}">
                     <div class="flex-shrink-0">
@@ -336,7 +341,7 @@ const App = {
                         </svg>
                     </div>
                     <div class="flex-1 min-w-0">
-                        <p class="text-sm font-medium text-slate-100 truncate">${this.escapeHtml(f.name)}</p>
+                        <p class="text-sm font-medium text-slate-100 truncate">${this.escapeHtml(f.name)} ${healthIcon[f.health] || ''}${f.health && f.health !== 'healthy' ? `<button onclick="App.repairFile('${this.escapeHtml(f.name)}')" class="text-xs text-amber-400 hover:text-amber-300 ml-2">修复</button>` : ''}</p>
                         <p class="text-xs text-slate-400">${this.escapeHtml(f.size_human)} &middot; ${this.formatDate(f.date)}</p>
                     </div>
                     <div class="flex gap-1.5 flex-shrink-0">
@@ -426,6 +431,20 @@ const App = {
         } catch (err) {
             this.showError('Failed to delete file');
             this.loadFiles();
+        }
+    },
+
+    async repairFile(name) {
+        try {
+            const res = await fetch(`/api/files/${encodeURIComponent(name)}/repair`, { method: 'POST' });
+            const data = await res.json();
+            if (data.ok) {
+                this.loadFiles();
+            } else {
+                this.showError(`修复失败: ${data.error}`);
+            }
+        } catch (err) {
+            this.showError(`修复请求失败: ${err}`);
         }
     },
 

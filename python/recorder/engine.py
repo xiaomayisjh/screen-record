@@ -9,6 +9,10 @@ from .audio import StreamingAudioRecorder
 from .cmd_builder import CmdBuilder, ENCODER_HWACCEL_MAP, HW_ENCODERS
 from .webcam import DeviceEnumerator, WebcamCapturer
 from .settings_manager import SettingsManager, ENCODER_NAMES
+from .repair import (
+    FileHealthChecker, write_recording_marker,
+    read_recording_marker, delete_recording_marker,
+)
 
 
 _startupinfo = subprocess.STARTUPINFO()
@@ -50,9 +54,20 @@ class RecordingEngine:
         self._current_encoder = None
         self._current_hwaccel = None
         self._fallback_info = None
+        self.health_checker = FileHealthChecker(
+            os.path.join(base_dir, "ffmpeg.exe"), self.captures_dir
+        )
 
         os.makedirs(self.captures_dir, exist_ok=True)
         self._cleanup_tmp()
+        repair_result = self.health_checker.auto_repair_on_startup()
+        if repair_result.repaired or repair_result.failed:
+            import logging
+            log = logging.getLogger("engine")
+            for name in repair_result.repaired:
+                log.info("Auto-repaired: %s", name)
+            for item in repair_result.failed:
+                log.warning("Auto-repair failed: %s — %s", item["name"], item["error"])
 
     def _notify_state_change(self):
         """Must be called with self._lock held."""
@@ -75,6 +90,7 @@ class RecordingEngine:
             "encoder": self._current_encoder,
             "hwaccel": self._current_hwaccel,
             "fallback": self._fallback_info,
+            "output_path": os.path.join(self.captures_dir, self._filename) if self._filename else None,
         }
         if self._state == "recording" and self._recording_start:
             result["elapsed"] = time.time() - self._recording_start
@@ -138,8 +154,8 @@ class RecordingEngine:
 
         self._current_hwaccel = self.cmd_builder.hwaccel
 
-        tmp_video = os.path.join(self.tmp_dir, "tmp.mkv")
-        video_cmd = self.cmd_builder.get_capture_cmd(tmp_video)
+        output_path = os.path.join(self.captures_dir, self._filename)
+        video_cmd = self.cmd_builder.get_capture_cmd(output_path)
         self._stderr_file = open(
             os.path.join(self.tmp_dir, "ffmpeg_stderr.log"), "w",
             encoding="utf-8", errors="replace",
@@ -153,6 +169,11 @@ class RecordingEngine:
         )
 
         self._recording_start = time.time()
+
+        write_recording_marker(
+            self.captures_dir, self._filename,
+            self._current_encoder, self._current_hwaccel,
+        )
 
         audio_devices = settings.get("audio_devices", [])
         if settings.get("audio_mode") == "default" or not audio_devices:
@@ -287,33 +308,50 @@ class RecordingEngine:
                 self.audio_recorder.stop()
                 if self._webcam_capturer:
                     self._webcam_capturer.stop()
+                delete_recording_marker(self.captures_dir)
                 self._cleanup_tmp()
                 return
             time.sleep(1.0)
 
     def _merge(self):
         try:
-            audio_delay_ms = 0
-            if self._audio_start and self._recording_start:
-                delay = self._audio_start - self._recording_start
-                if delay > 0:
-                    audio_delay_ms = int(delay * 1000)
-
             output_path = os.path.join(self.captures_dir, self._filename)
             audio_ok = self._check_audio_files()
+            has_webcam = self._webcam_capturer is not None
 
-            if not audio_ok:
-                tmp_video = os.path.join(self.tmp_dir, "tmp.mkv")
-                if os.path.exists(tmp_video):
-                    shutil.copy2(tmp_video, output_path)
-                else:
-                    self._error_message = "Video file not found after recording"
+            if not audio_ok and not has_webcam:
+                tmp_remux = output_path + ".remux.mp4"
+                remux_cmd = self.cmd_builder.get_remux_cmd(output_path, tmp_remux)
+                stderr_file = open(
+                    os.path.join(self.tmp_dir, "remux_stderr.log"), "w",
+                    encoding="utf-8", errors="replace",
+                )
+                proc = subprocess.Popen(
+                    args=remux_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    startupinfo=_startupinfo,
+                )
+                proc.wait()
+                stderr_file.close()
+                if proc.returncode == 0 and os.path.isfile(tmp_remux):
+                    os.replace(tmp_remux, output_path)
+                elif os.path.isfile(tmp_remux):
+                    os.remove(tmp_remux)
             else:
+                tmp_merged = output_path + ".merged.mp4"
+                audio_delay_ms = 0
+                if self._audio_start and self._recording_start:
+                    delay = self._audio_start - self._recording_start
+                    if delay > 0:
+                        audio_delay_ms = int(delay * 1000)
+
                 devices = self.audio_recorder.devices
                 self.cmd_builder.config(
                     aud_list=devices, audio_delay_ms=audio_delay_ms
                 )
-                merge_cmd = self.cmd_builder.get_merge_cmd(output_path)
+                merge_cmd = self.cmd_builder.get_merge_cmd(tmp_merged)
                 stderr_file = open(
                     os.path.join(self.tmp_dir, "merge_stderr.log"), "w",
                     encoding="utf-8", errors="replace",
@@ -339,10 +377,17 @@ class RecordingEngine:
                     self._error_message = (
                         f"Merge failed (exit {self._merge_proc.returncode}): {merge_err}"
                     )
+                    if os.path.isfile(tmp_merged):
+                        os.remove(tmp_merged)
+                else:
+                    if os.path.isfile(tmp_merged):
+                        os.replace(tmp_merged, output_path)
 
+            delete_recording_marker(self.captures_dir)
             self._cleanup_tmp()
         except Exception as e:
             self._error_message = str(e)
+            delete_recording_marker(self.captures_dir)
         finally:
             with self._lock:
                 self._state = "idle"
@@ -362,6 +407,15 @@ class RecordingEngine:
         self._close_stderr_file()
         if os.path.isdir(self.tmp_dir):
             shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def check_files_health(self):
+        return self.health_checker.check_all_files()
+
+    def repair_file(self, name):
+        return self.health_checker.repair_file(name)
+
+    def repair_all_files(self):
+        return self.health_checker.repair_all()
 
     def list_files(self):
         files = []

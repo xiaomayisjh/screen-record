@@ -3,6 +3,7 @@ import time
 import os
 from flask import jsonify, request, send_from_directory, Response
 from recorder.settings_manager import ENCODER_NAMES, HWACCEL_NAMES, ENCODER_HWACCEL_MAP
+from recorder.repair import FileHealth
 
 
 def register_api(app):
@@ -28,7 +29,8 @@ def register_api(app):
                 "webcam": data.get("webcam", False),
                 "webcam_device": data.get("webcam_device", ""),
             })
-            return jsonify({"ok": True, "filename": _engine()._filename})
+            state = _engine().get_state()
+            return jsonify({"ok": True, "filename": _engine()._filename, "output_path": state.get("output_path")})
         except RuntimeError as e:
             return jsonify({"ok": False, "error": str(e)}), 409
 
@@ -39,7 +41,11 @@ def register_api(app):
 
     @app.route("/api/files")
     def api_files():
-        return jsonify({"files": _engine().list_files()})
+        files = _engine().list_files()
+        health_map = _engine().check_files_health()
+        for f in files:
+            f["health"] = health_map.get(f["name"], FileHealth.HEALTHY).value
+        return jsonify({"files": files})
 
     @app.route("/api/files/<name>", methods=["DELETE"])
     def api_delete_file(name):
@@ -155,6 +161,26 @@ def register_api(app):
                 ],
             })
         return jsonify({"hwaccels": hwaccels_list})
+
+    @app.route("/api/files/health")
+    def api_files_health():
+        health_map = _engine().check_files_health()
+        result = {}
+        for name, health in health_map.items():
+            result[name] = health.value
+        return jsonify({"health": result})
+
+    @app.route("/api/files/<name>/repair", methods=["POST"])
+    def api_repair_file(name):
+        success, error = _engine().repair_file(name)
+        if success:
+            return jsonify({"ok": True, "name": name})
+        return jsonify({"ok": False, "name": name, "error": error}), 500
+
+    @app.route("/api/repair", methods=["POST"])
+    def api_repair_all():
+        result = _engine().repair_all_files()
+        return jsonify({"ok": True, **result.to_dict()})
 
     @app.route("/api/filename/next")
     def api_next_filename():

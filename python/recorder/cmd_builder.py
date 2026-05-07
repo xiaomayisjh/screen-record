@@ -83,7 +83,17 @@ class CmdBuilder:
 
         self._add_encoder_params(cmd)
 
+        cmd.extend(["-movflags", "+frag_keyframe+empty_moov"])
+        cmd.extend(["-flush_packets", "1"])
         cmd.extend(["-y", filename])
+        return cmd
+
+    def get_remux_cmd(self, input_path, output_path):
+        cmd = [self.ffmpeg]
+        cmd.extend(["-i", input_path])
+        cmd.extend(["-c:v", "copy"])
+        cmd.extend(["-movflags", "+faststart"])
+        cmd.extend(["-y", output_path])
         return cmd
 
     def get_merge_cmd(self, filename):
@@ -124,11 +134,11 @@ class CmdBuilder:
                 "-vf", "[2:v] scale=640:-1 [inner]; [0:0][inner] overlay=0:0 [out]",
                 "-map", "[out]",
             ])
-        if not self.enable_webcam:
-            if self.encoder in HW_ENCODERS or self.encoder == "libx264":
-                self._add_encoder_params(cmd)
-            else:
-                cmd.extend(["-c:v", "copy"])
+            self._add_encoder_params(cmd)
+        else:
+            cmd.extend(["-c:v", "copy"])
+
+        cmd.extend(["-movflags", "+faststart"])
         cmd.extend(["-shortest"])
         cmd.extend(["-y", filename])
         return cmd

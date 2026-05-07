@@ -105,6 +105,7 @@ struct EngineStatus {
     filename: Option<String>,
     elapsed: f64,
     error: Option<String>,
+    output_path: Option<String>,
 }
 
 impl Default for EngineStatus {
@@ -116,6 +117,7 @@ impl Default for EngineStatus {
             filename: None,
             elapsed: 0.0,
             error: None,
+            output_path: None,
         }
     }
 }
@@ -196,6 +198,32 @@ struct AudioDeviceInfo {
 #[derive(Debug, Serialize)]
 struct FilenameResponse {
     filename: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FileHealth {
+    Healthy,
+    Fragmented,
+    Broken,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RepairResult {
+    repaired: Vec<String>,
+    failed: Vec<FailedRepair>,
+    healthy: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FailedRepair {
+    name: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    health: std::collections::HashMap<String, String>,
 }
 
 // ============================================================
@@ -295,15 +323,15 @@ impl SettingsManager {
             return available;
         }
 
-        let output = Command::new(&self.ffmpeg_path)
-            .arg("-encoders")
+        let mut cmd = Command::new(&self.ffmpeg_path);
+        cmd.arg("-encoders")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
         #[cfg(windows)]
-        let output = output.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(CREATE_NO_WINDOW);
 
-        let output = match output.output() {
+        let output = match cmd.output() {
             Ok(o) => o,
             Err(_) => return available,
         };
@@ -462,8 +490,24 @@ fn build_capture_cmd(
         _ => {}
     }
     
+    cmd.extend(["-movflags".to_string(), "+frag_keyframe+empty_moov".to_string()]);
+    cmd.extend(["-flush_packets".to_string(), "1".to_string()]);
     cmd.extend(["-y".to_string(), tmp_video.to_string_lossy().to_string()]);
     cmd
+}
+
+fn build_remux_cmd(ffmpeg: &Path, input: &Path, output: &Path) -> Vec<String> {
+    vec![
+        ffmpeg.to_string_lossy().to_string(),
+        "-i".to_string(),
+        input.to_string_lossy().to_string(),
+        "-c:v".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        "-y".to_string(),
+        output.to_string_lossy().to_string(),
+    ]
 }
 
 /// A handle to a cpal audio recording thread. Drop or call stop() to finish.
@@ -665,7 +709,7 @@ fn build_merge_cmd(
     audio_count: usize,
     audio_delay_ms: u64,
     has_webcam: bool,
-    encoder: &str,
+    _encoder: &str,
 ) -> Vec<String> {
     let mut cmd = vec![ffmpeg.to_string_lossy().to_string()];
 
@@ -740,22 +784,10 @@ fn build_merge_cmd(
 
     // Video codec
     if !has_webcam {
-        match encoder {
-            "h264_nvenc" | "h264_qsv" | "h264_amf" | "libx264" => {
-                cmd.extend(["-c:v".to_string(), encoder.to_string()]);
-                if encoder == "libx264" {
-                    cmd.extend(["-preset".to_string(), "fast".to_string()]);
-                    cmd.extend(["-crf".to_string(), "23".to_string()]);
-                } else {
-                    cmd.extend(["-preset".to_string(), "fast".to_string()]);
-                }
-            }
-            _ => {
-                cmd.extend(["-c:v".to_string(), "copy".to_string()]);
-            }
-        }
+        cmd.extend(["-c:v".to_string(), "copy".to_string()]);
     }
 
+    cmd.extend(["-movflags".to_string(), "+faststart".to_string()]);
     cmd.extend([
         "-shortest".to_string(),
         "-y".to_string(),
@@ -915,6 +947,42 @@ fn parse_dshow_webcams(output: &str) -> Vec<String> {
     webcams
 }
 
+const MARKER_FILENAME: &str = ".recording";
+
+fn write_recording_marker(captures_dir: &Path, filename: &str, encoder: &str, hwaccel: Option<&str>) {
+    let marker = serde_json::json!({
+        "filename": filename,
+        "started_at": Local::now().to_rfc3339(),
+        "encoder": encoder,
+        "hwaccel": hwaccel.unwrap_or(""),
+    });
+    let _ = std::fs::write(captures_dir.join(MARKER_FILENAME), marker.to_string());
+}
+
+fn read_recording_marker(captures_dir: &Path) -> Option<serde_json::Value> {
+    let path = captures_dir.join(MARKER_FILENAME);
+    if !path.is_file() {
+        return None;
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn delete_recording_marker(captures_dir: &Path) {
+    let _ = std::fs::remove_file(captures_dir.join(MARKER_FILENAME));
+}
+
+fn is_likely_fragmented_mp4(filepath: &Path) -> bool {
+    if let Ok(mut f) = std::fs::File::open(filepath) {
+        let mut header = [0u8; 12];
+        if std::io::Read::read_exact(&mut f, &mut header).is_ok() {
+            return &header[4..8] == b"ftyp";
+        }
+    }
+    false
+}
+
 // ============================================================
 // SECTION 7: Recording Engine
 // ============================================================
@@ -956,6 +1024,7 @@ struct RecordingEngine {
     settings: Arc<Mutex<SettingsManager>>,
     device_enumerator: Arc<Mutex<DeviceEnumerator>>,
     ffmpeg_path: PathBuf,
+    ffprobe_path: PathBuf,
     captures_dir: PathBuf,
     tmp_dir: PathBuf,
 }
@@ -978,6 +1047,7 @@ impl RecordingEngine {
         let tmp_dir = base_dir.join("tmp");
         let (state_tx, state_rx) = watch::channel(EngineStatus::default());
         let device_enumerator = Arc::new(Mutex::new(DeviceEnumerator::new(ffmpeg_path.clone())));
+        let ffprobe_path = ffmpeg_path.parent().unwrap_or(Path::new(".")).join("ffprobe.exe");
 
         let _ = std::fs::create_dir_all(&captures_dir);
         // Clean up any leftover tmp
@@ -990,8 +1060,21 @@ impl RecordingEngine {
             settings,
             device_enumerator,
             ffmpeg_path,
+            ffprobe_path,
             captures_dir,
             tmp_dir,
+        }
+    }
+
+    fn run_auto_repair(&self) {
+        let repair_result = self.auto_repair_on_startup();
+        if !repair_result.repaired.is_empty() || !repair_result.failed.is_empty() {
+            for name in &repair_result.repaired {
+                tracing::info!("Auto-repaired: {}", name);
+            }
+            for item in &repair_result.failed {
+                tracing::warn!("Auto-repair failed: {} — {}", item.name, item.error);
+            }
         }
     }
 
@@ -1072,8 +1155,8 @@ impl RecordingEngine {
         };
 
         // Spawn video capture process (blocking I/O, before inner lock)
-        let tmp_video = self.tmp_dir.join("tmp.mkv");
-        let video_cmd = build_capture_cmd(&self.ffmpeg_path, &settings, &source, &tmp_video);
+        let output_path = self.captures_dir.join(&filename);
+        let video_cmd = build_capture_cmd(&self.ffmpeg_path, &settings, &source, &output_path);
         let stderr_file = std::fs::File::create(self.tmp_dir.join("ffmpeg_stderr.log")).ok();
         let video_proc = spawn_ffmpeg(&video_cmd, stderr_file)?;
 
@@ -1159,6 +1242,7 @@ impl RecordingEngine {
         inner.has_webcam = has_webcam && inner.webcam_process.is_some();
 
         self.notify(&inner);
+        write_recording_marker(&self.captures_dir, &filename, &settings.encoder, None);
         drop(inner);
 
         // Spawn monitor task
@@ -1274,6 +1358,145 @@ impl RecordingEngine {
             false
         }
     }
+
+    fn check_file_health(&self, filepath: &Path) -> FileHealth {
+        if !filepath.is_file() {
+            return FileHealth::Broken;
+        }
+        let mut cmd = Command::new(&self.ffprobe_path);
+        cmd.args(["-v", "error", "-show_format"])
+            .arg(filepath)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        match cmd.output() {
+            Ok(o) if o.status.success() => {
+                if is_likely_fragmented_mp4(filepath) {
+                    FileHealth::Fragmented
+                } else {
+                    FileHealth::Healthy
+                }
+            }
+            _ => FileHealth::Broken,
+        }
+    }
+
+    fn check_all_files_health(&self) -> std::collections::HashMap<String, FileHealth> {
+        let mut results = std::collections::HashMap::new();
+        if let Ok(entries) = std::fs::read_dir(&self.captures_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension() {
+                        let ext = ext.to_string_lossy().to_lowercase();
+                        if ["mp4", "mkv", "avi"].contains(&ext.as_str()) {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if !name.starts_with('.') {
+                                results.insert(name, self.check_file_health(&path));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        results
+    }
+
+    fn repair_file(&self, name: &str) -> Result<(), String> {
+        let safe_name = Path::new(name)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let filepath = self.captures_dir.join(&safe_name);
+        if !filepath.is_file() {
+            return Err(format!("File not found: {}", safe_name));
+        }
+        let tmp_output = self.captures_dir.join(format!("{}.repairing.mp4", safe_name));
+        let cmd = build_remux_cmd(&self.ffmpeg_path, &filepath, &tmp_output);
+        let mut proc = spawn_ffmpeg(&cmd, None)
+            .map_err(|e| format!("Failed to start repair: {}", e))?;
+        let status = proc.wait()
+            .map_err(|e| format!("Repair process error: {}", e))?;
+        if status.success() && tmp_output.is_file() {
+            std::fs::rename(&tmp_output, &filepath)
+                .map_err(|e| format!("Failed to replace file: {}", e))
+        } else {
+            let _ = std::fs::remove_file(&tmp_output);
+            let broken_path = format!("{}.broken", filepath.display());
+            let _ = std::fs::rename(&filepath, broken_path);
+            Err(format!("FFmpeg repair failed (exit {:?})", status.code()))
+        }
+    }
+
+    fn repair_all_files(&self) -> RepairResult {
+        let mut result = RepairResult {
+            repaired: vec![],
+            failed: vec![],
+            healthy: vec![],
+        };
+        let health_map = self.check_all_files_health();
+        for (name, health) in health_map {
+            match health {
+                FileHealth::Healthy => result.healthy.push(name),
+                FileHealth::Fragmented | FileHealth::Broken => {
+                    match self.repair_file(&name) {
+                        Ok(()) => result.repaired.push(name),
+                        Err(e) => result.failed.push(FailedRepair { name, error: e }),
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn auto_repair_on_startup(&self) -> RepairResult {
+        let mut result = RepairResult {
+            repaired: vec![],
+            failed: vec![],
+            healthy: vec![],
+        };
+        if let Some(marker) = read_recording_marker(&self.captures_dir) {
+            if let Some(filename) = marker.get("filename").and_then(|v| v.as_str()) {
+                let filepath = self.captures_dir.join(filename);
+                let health = self.check_file_health(&filepath);
+                match health {
+                    FileHealth::Healthy => result.healthy.push(filename.to_string()),
+                    FileHealth::Fragmented | FileHealth::Broken => {
+                        match self.repair_file(filename) {
+                            Ok(()) => result.repaired.push(filename.to_string()),
+                            Err(e) => result.failed.push(FailedRepair {
+                                name: filename.to_string(),
+                                error: e,
+                            }),
+                        }
+                    }
+                }
+            }
+            delete_recording_marker(&self.captures_dir);
+        }
+        let health_map = self.check_all_files_health();
+        let already_processed: std::collections::HashSet<String> = result.repaired.iter()
+            .chain(result.healthy.iter())
+            .chain(result.failed.iter().map(|f| &f.name))
+            .cloned()
+            .collect();
+        for (name, health) in health_map {
+            if already_processed.contains(&name) {
+                continue;
+            }
+            match health {
+                FileHealth::Healthy => result.healthy.push(name),
+                FileHealth::Fragmented | FileHealth::Broken => {
+                    match self.repair_file(&name) {
+                        Ok(()) => result.repaired.push(name),
+                        Err(e) => result.failed.push(FailedRepair { name, error: e }),
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 /// Lightweight reference to engine pieces for async tasks
@@ -1358,24 +1581,17 @@ impl EngineRef {
     }
 
     async fn do_merge(&self) -> Result<(), String> {
-        // Read settings before inner lock to avoid nested lock
         let encoder = self.settings.lock().await.get_all().encoder;
-
         let inner = self.inner.lock().await;
-        let filename = inner
-            .filename
-            .clone()
+        let filename = inner.filename.clone()
             .ok_or_else(|| "No filename set".to_string())?;
-
         let audio_delay_ms = if let (Some(rec_start), Some(aud_start)) =
             (inner.recording_start, inner.audio_start)
         {
-            let delay = aud_start.duration_since(rec_start);
-            delay.as_millis() as u64
+            aud_start.duration_since(rec_start).as_millis() as u64
         } else {
             0
         };
-
         let audio_count = inner.audio_device_count;
         let has_webcam = inner.has_webcam;
         drop(inner);
@@ -1383,68 +1599,45 @@ impl EngineRef {
         let output_path = self.captures_dir.join(&filename);
 
         if audio_count == 0 && !has_webcam {
-            // No audio, just copy video
-            let tmp_video = self.tmp_dir.join("tmp.mkv");
-            if tmp_video.is_file() {
-                std::fs::copy(&tmp_video, &output_path)
-                    .map_err(|e| format!("Failed to copy video: {}", e))?;
+            let tmp_remux = self.captures_dir.join(format!("{}.remux.mp4", filename));
+            let remux_cmd = build_remux_cmd(&self.ffmpeg_path, &output_path, &tmp_remux);
+            let mut proc = spawn_ffmpeg(&remux_cmd, None)
+                .map_err(|e| format!("Failed to start remux: {}", e))?;
+            let status = tokio::task::spawn_blocking(move || proc.wait())
+                .await
+                .map_err(|e| format!("Remux task panicked: {}", e))?
+                .map_err(|e| format!("Remux process error: {}", e))?;
+            if status.success() && tmp_remux.is_file() {
+                std::fs::rename(&tmp_remux, &output_path)
+                    .map_err(|e| format!("Failed to replace file: {}", e))?;
             } else {
-                return Err("Video file not found after recording".to_string());
+                let _ = std::fs::remove_file(&tmp_remux);
             }
-            return Ok(());
-        }
-
-        // Check audio files
-        let mut valid_audio = 0;
-        for i in 0..audio_count {
-            let wav = self.tmp_dir.join(format!("tmp_{}.wav", i));
-            if wav.is_file() {
-                if let Ok(meta) = wav.metadata() {
-                    if meta.len() > 100 {
-                        valid_audio += 1;
-                    }
-                }
+        } else {
+            let tmp_merged = self.captures_dir.join(format!("{}.merged.mp4", filename));
+            let merge_cmd = build_merge_cmd(
+                &self.ffmpeg_path, &self.tmp_dir, &tmp_merged,
+                audio_count, audio_delay_ms, has_webcam, &encoder,
+            );
+            let stderr_file = std::fs::File::create(self.tmp_dir.join("merge_stderr.log")).ok();
+            let mut proc = spawn_ffmpeg(&merge_cmd, stderr_file)
+                .map_err(|e| format!("Failed to start merge: {}", e))?;
+            let status = tokio::task::spawn_blocking(move || proc.wait())
+                .await
+                .map_err(|e| format!("Merge task panicked: {}", e))?
+                .map_err(|e| format!("Merge process error: {}", e))?;
+            if !status.success() {
+                let stderr = read_log(&self.tmp_dir.join("merge_stderr.log"));
+                let _ = std::fs::remove_file(&tmp_merged);
+                return Err(format!("Merge failed (exit {}): {}", status.code().unwrap_or(-1), stderr));
+            }
+            if tmp_merged.is_file() {
+                std::fs::rename(&tmp_merged, &output_path)
+                    .map_err(|e| format!("Failed to replace file: {}", e))?;
             }
         }
 
-        if valid_audio == 0 && !has_webcam {
-            // Audio files too small or missing, just copy video
-            let tmp_video = self.tmp_dir.join("tmp.mkv");
-            if tmp_video.is_file() {
-                std::fs::copy(&tmp_video, &output_path)
-                    .map_err(|e| format!("Failed to copy video: {}", e))?;
-            }
-            return Ok(());
-        }
-
-        let merge_cmd = build_merge_cmd(
-            &self.ffmpeg_path,
-            &self.tmp_dir,
-            &output_path,
-            valid_audio,
-            audio_delay_ms,
-            has_webcam,
-            &encoder,
-        );
-
-        let stderr_file = std::fs::File::create(self.tmp_dir.join("merge_stderr.log")).ok();
-        let mut proc = spawn_ffmpeg(&merge_cmd, stderr_file)
-            .map_err(|e| format!("Failed to start merge: {}", e))?;
-
-        let status = tokio::task::spawn_blocking(move || proc.wait())
-            .await
-            .map_err(|e| format!("Merge task panicked: {}", e))?
-            .map_err(|e| format!("Merge process error: {}", e))?;
-
-        if !status.success() {
-            let stderr = read_log(&self.tmp_dir.join("merge_stderr.log"));
-            return Err(format!(
-                "Merge failed (exit {}): {}",
-                status.code().unwrap_or(-1),
-                stderr
-            ));
-        }
-
+        delete_recording_marker(&self.captures_dir);
         Ok(())
     }
 }
@@ -1466,6 +1659,7 @@ fn build_engine_status(inner: &EngineInner) -> EngineStatus {
         filename: inner.filename.clone(),
         elapsed,
         error: inner.error_message.clone(),
+        output_path: None,
     }
 }
 
@@ -1668,6 +1862,22 @@ struct CliArgs {
     /// Path to ffmpeg executable
     #[arg(long)]
     ffmpeg_path: Option<PathBuf>,
+
+    /// Scan and repair all broken recording files
+    #[arg(long)]
+    repair: bool,
+
+    /// Repair a specific recording file
+    #[arg(long)]
+    repair_file: Option<String>,
+
+    /// Check health status of recording files
+    #[arg(long)]
+    check_files: bool,
+
+    /// Output results in JSON format
+    #[arg(long)]
+    json_output: bool,
 }
 
 fn is_cli_mode(args: &CliArgs) -> bool {
@@ -1684,6 +1894,9 @@ fn is_cli_mode(args: &CliArgs) -> bool {
         || args.schedule.is_some()
         || args.list_devices
         || args.webcam
+        || args.repair
+        || args.repair_file.is_some()
+        || args.check_files
 }
 
 // ============================================================
@@ -1903,6 +2116,32 @@ async fn api_best_encoder(State(state): State<AppState>) -> Json<BestEncoderResp
     })
 }
 
+async fn api_files_health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let health_map = state.engine.check_all_files_health();
+    let result: std::collections::HashMap<String, String> = health_map
+        .into_iter()
+        .map(|(k, v)| (k, format!("{:?}", v).to_lowercase()))
+        .collect();
+    Json(HealthResponse { health: result })
+}
+
+async fn api_repair_file(
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    match state.engine.repair_file(&name) {
+        Ok(()) => Ok(Json(serde_json::json!({"ok": true, "name": name}))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { ok: false, error: e }),
+        )),
+    }
+}
+
+async fn api_repair_all(State(state): State<AppState>) -> Json<RepairResult> {
+    Json(state.engine.repair_all_files())
+}
+
 // ============================================================
 // SECTION 11: Web Server Setup
 // ============================================================
@@ -1930,6 +2169,9 @@ fn create_router(state: AppState) -> Router {
         .route("/api/filename/next", get(api_next_filename))
         .route("/api/encoders", get(api_available_encoders))
         .route("/api/encoders/best", get(api_best_encoder))
+        .route("/api/files/health", get(api_files_health))
+        .route("/api/files/{name}/repair", post(api_repair_file))
+        .route("/api/repair", post(api_repair_all))
         .with_state(state)
 }
 
@@ -2003,6 +2245,7 @@ async fn run_cli_mode(args: CliArgs) {
             ffmpeg_path.clone(),
         ))
     };
+    engine.run_auto_repair();
 
     // --list-devices
     if args.list_devices {
@@ -2040,6 +2283,68 @@ async fn run_cli_mode(args: CliArgs) {
         println!("提示: 选择\"输出设备\"可通过 WASAPI loopback 录制系统音频。");
         println!("      同时选择输入+输出设备可实现麦克风+扬声器同时录制。");
         return;
+    }
+
+    if args.repair {
+        let result = engine.repair_all_files();
+        if args.json_output {
+            println!("{}", serde_json::to_string(&result).unwrap_or_default());
+        } else {
+            for name in &result.repaired {
+                println!("  ✓ {} (repaired)", name);
+            }
+            for item in &result.failed {
+                println!("  ✗ {} — {}", item.name, item.error);
+            }
+            if !result.healthy.is_empty() {
+                println!("  {} healthy files", result.healthy.len());
+            }
+        }
+        std::process::exit(if result.failed.is_empty() { 0 } else { 1 });
+    }
+
+    if let Some(ref file) = args.repair_file {
+        match engine.repair_file(file) {
+            Ok(()) => {
+                if args.json_output {
+                    println!("{}", serde_json::json!({"ok": true, "name": file}));
+                } else {
+                    println!("Repaired: {}", file);
+                }
+                std::process::exit(0);
+            }
+            Err(e) => {
+                if args.json_output {
+                    eprintln!("{}", serde_json::json!({"ok": false, "name": file, "error": e}));
+                } else {
+                    eprintln!("Repair failed: {} — {}", file, e);
+                }
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args.check_files {
+        let health_map = engine.check_all_files_health();
+        if args.json_output {
+            let result: std::collections::HashMap<String, String> = health_map
+                .into_iter()
+                .map(|(k, v)| (k, format!("{:?}", v).to_lowercase()))
+                .collect();
+            println!("{}", serde_json::to_string(&result).unwrap_or_default());
+        } else if health_map.is_empty() {
+            println!("No recording files found");
+        } else {
+            for (name, health) in &health_map {
+                let icon = match health {
+                    FileHealth::Healthy => "✓",
+                    FileHealth::Fragmented => "⚠",
+                    FileHealth::Broken => "✗",
+                };
+                println!("  {} {} ({:?})", icon, name, health);
+            }
+        }
+        std::process::exit(0);
     }
 
     // --schedule: wait for start time, get optional end time
@@ -2372,6 +2677,7 @@ async fn main() {
 
         let settings = Arc::new(Mutex::new(SettingsManager::new(&base_dir, ffmpeg_path.clone())));
         let engine = Arc::new(RecordingEngine::new(base_dir, settings, ffmpeg_path));
+        engine.run_auto_repair();
 
         let state = AppState {
             engine: engine.clone(),
