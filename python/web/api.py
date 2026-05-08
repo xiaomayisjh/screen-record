@@ -2,7 +2,8 @@ import json
 import time
 import os
 from flask import jsonify, request, send_from_directory, Response
-from recorder.settings_manager import ENCODER_NAMES
+from recorder.settings_manager import ENCODER_NAMES, HWACCEL_NAMES, ENCODER_HWACCEL_MAP
+from recorder.repair import FileHealth
 
 
 def register_api(app):
@@ -28,7 +29,8 @@ def register_api(app):
                 "webcam": data.get("webcam", False),
                 "webcam_device": data.get("webcam_device", ""),
             })
-            return jsonify({"ok": True, "filename": _engine()._filename})
+            state = _engine().get_state()
+            return jsonify({"ok": True, "filename": _engine()._filename, "output_path": state.get("output_path")})
         except RuntimeError as e:
             return jsonify({"ok": False, "error": str(e)}), 409
 
@@ -39,7 +41,11 @@ def register_api(app):
 
     @app.route("/api/files")
     def api_files():
-        return jsonify({"files": _engine().list_files()})
+        files = _engine().list_files()
+        health_map = _engine().check_files_health()
+        for f in files:
+            f["health"] = health_map.get(f["name"], FileHealth.HEALTHY).value
+        return jsonify({"files": files})
 
     @app.route("/api/files/<name>", methods=["DELETE"])
     def api_delete_file(name):
@@ -117,23 +123,64 @@ def register_api(app):
     @app.route("/api/encoders")
     def api_available_encoders():
         available = _settings().detect_available_encoders()
+        available_hwaccels = _settings().detect_available_hwaccels()
         encoders_list = []
         for enc in available:
+            hwaccel = ENCODER_HWACCEL_MAP.get(enc)
             encoders_list.append({
                 "id": enc,
                 "name": ENCODER_NAMES.get(enc, enc),
-                "is_hardware": enc in ("h264_nvenc", "h264_qsv", "h264_amf")
+                "is_hardware": enc in ENCODER_HWACCEL_MAP,
+                "hwaccel": hwaccel,
+                "hwaccel_available": hwaccel in available_hwaccels if hwaccel else None,
             })
         return jsonify({"encoders": encoders_list})
 
     @app.route("/api/encoders/best")
     def api_best_encoder():
         best = _settings().get_best_encoder()
+        hwaccel = ENCODER_HWACCEL_MAP.get(best)
         return jsonify({
             "encoder": best,
             "name": ENCODER_NAMES.get(best, best),
-            "is_hardware": best in ("h264_nvenc", "h264_qsv", "h264_amf")
+            "is_hardware": best in ENCODER_HWACCEL_MAP,
+            "hwaccel": hwaccel,
+            "hwaccel_name": HWACCEL_NAMES.get(hwaccel) if hwaccel else None,
         })
+
+    @app.route("/api/hwaccels")
+    def api_available_hwaccels():
+        available = _settings().detect_available_hwaccels()
+        hwaccels_list = []
+        for hw in available:
+            hwaccels_list.append({
+                "id": hw,
+                "name": HWACCEL_NAMES.get(hw, hw),
+                "compatible_encoders": [
+                    enc for enc, hwa in ENCODER_HWACCEL_MAP.items() if hwa == hw
+                ],
+            })
+        return jsonify({"hwaccels": hwaccels_list})
+
+    @app.route("/api/files/health")
+    def api_files_health():
+        health_map = _engine().check_files_health()
+        result = {}
+        for name, health in health_map.items():
+            result[name] = health.value
+        return jsonify({"health": result})
+
+    @app.route("/api/files/<name>/repair", methods=["POST"])
+    def api_repair_file(name):
+        success, error = _engine().repair_file(name)
+        if success:
+            return jsonify({"ok": True, "name": name})
+        return jsonify({"ok": False, "name": name, "error": error}), 500
+
+    @app.route("/api/repair", methods=["POST"])
+    def api_repair_all():
+        result = _engine().repair_all_files()
+        return jsonify({"ok": True, **result.to_dict()})
 
     @app.route("/api/filename/next")
     def api_next_filename():

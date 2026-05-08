@@ -6,6 +6,9 @@ const App = {
         source: 'desktop',
         webcam: false,
         error: null,
+        encoder: null,
+        hwaccel: null,
+        fallback: null,
     },
     settings: {},
     devices: { audio: [], webcam: [] },
@@ -54,6 +57,9 @@ const App = {
         this.state.recording = data.recording;
         this.state.merging = data.merging;
         this.state.error = data.error;
+        this.state.encoder = data.encoder || null;
+        this.state.hwaccel = data.hwaccel || null;
+        this.state.fallback = data.fallback || null;
 
         if (data.recording && data.elapsed != null) {
             this.state.elapsed = data.elapsed;
@@ -61,7 +67,6 @@ const App = {
 
         this.updateRecordUI();
 
-        // When merging finishes, refresh files
         if (wasMerging && !data.merging && !data.recording) {
             this.loadFiles();
             this.loadNextFilename();
@@ -182,6 +187,8 @@ const App = {
         const statusText = document.getElementById('status-text');
         const mergingIndicator = document.getElementById('merging-indicator');
         const errorDisplay = document.getElementById('error-display');
+        const hwaccelBadge = document.getElementById('hwaccel-badge');
+        const fallbackNotice = document.getElementById('fallback-notice');
 
         // Disable controls during recording/merging
         const controls = ['filename', 'src-desktop', 'src-window', 'window-title'];
@@ -252,6 +259,32 @@ const App = {
             }
         }
 
+        // HW accel badge
+        if (hwaccelBadge) {
+            if (this.state.hwaccel && this.state.recording) {
+                const hwNames = {
+                    'qsv': 'Intel QSV',
+                    'd3d11va': 'D3D11VA',
+                    'cuda': 'CUDA',
+                    'dxva2': 'DXVA2',
+                };
+                hwaccelBadge.textContent = hwNames[this.state.hwaccel] || this.state.hwaccel;
+                hwaccelBadge.classList.remove('hidden');
+            } else {
+                hwaccelBadge.classList.add('hidden');
+            }
+        }
+
+        // Fallback notice
+        if (fallbackNotice) {
+            if (this.state.fallback && this.state.recording) {
+                document.getElementById('fallback-text').textContent = this.state.fallback.message;
+                fallbackNotice.classList.remove('hidden');
+            } else {
+                fallbackNotice.classList.add('hidden');
+            }
+        }
+
         // Error
         if (this.state.error) {
             this.showError(this.state.error);
@@ -295,6 +328,11 @@ const App = {
             }
 
             empty.classList.add('hidden');
+            const healthIcon = {
+                'healthy': '<span class="text-green-400">✓</span>',
+                'fragmented': '<span class="text-amber-400">⚠</span>',
+                'broken': '<span class="text-red-400">✗</span>',
+            };
             list.innerHTML = this.files.map(f => `
                 <div class="file-item flex items-center gap-3 bg-slate-800 rounded-xl p-4" data-name="${this.escapeHtml(f.name)}">
                     <div class="flex-shrink-0">
@@ -303,7 +341,7 @@ const App = {
                         </svg>
                     </div>
                     <div class="flex-1 min-w-0">
-                        <p class="text-sm font-medium text-slate-100 truncate">${this.escapeHtml(f.name)}</p>
+                        <p class="text-sm font-medium text-slate-100 truncate">${this.escapeHtml(f.name)} ${healthIcon[f.health] || ''}${f.health && f.health !== 'healthy' ? `<button onclick="App.repairFile('${this.escapeHtml(f.name)}')" class="text-xs text-amber-400 hover:text-amber-300 ml-2">修复</button>` : ''}</p>
                         <p class="text-xs text-slate-400">${this.escapeHtml(f.size_human)} &middot; ${this.formatDate(f.date)}</p>
                     </div>
                     <div class="flex gap-1.5 flex-shrink-0">
@@ -396,6 +434,20 @@ const App = {
         }
     },
 
+    async repairFile(name) {
+        try {
+            const res = await fetch(`/api/files/${encodeURIComponent(name)}/repair`, { method: 'POST' });
+            const data = await res.json();
+            if (data.ok) {
+                this.loadFiles();
+            } else {
+                this.showError(`修复失败: ${data.error}`);
+            }
+        } catch (err) {
+            this.showError(`修复请求失败: ${err}`);
+        }
+    },
+
     // ==================== SETTINGS ====================
 
     initSettingsControls() {
@@ -409,6 +461,7 @@ const App = {
 
         // Encoder select
         document.getElementById('encoder-select').addEventListener('change', () => {
+            this.updateEncoderHwaccelHint();
             this.debounceSaveSettings();
         });
 
@@ -445,11 +498,41 @@ const App = {
             const res = await fetch('/api/encoders');
             const data = await res.json();
             const select = document.getElementById('encoder-select');
-            select.innerHTML = data.encoders.map(enc =>
-                `<option value="${this.escapeHtml(enc.id)}">${this.escapeHtml(enc.name)}${enc.is_hardware ? ' (Hardware)' : ''}</option>`
-            ).join('');
+            select.innerHTML = data.encoders.map(enc => {
+                let label = this.escapeHtml(enc.name);
+                if (enc.is_hardware) {
+                    label += ' (HW';
+                    if (enc.hwaccel) {
+                        label += enc.hwaccel_available ? ' \u2713' : ' \u2717';
+                    }
+                    label += ')';
+                }
+                return `<option value="${this.escapeHtml(enc.id)}">${label}</option>`;
+            }).join('');
+            this.updateEncoderHwaccelHint();
         } catch (err) {
             console.error('Failed to load encoders:', err);
+        }
+    },
+
+    updateEncoderHwaccelHint() {
+        const select = document.getElementById('encoder-select');
+        const hint = document.getElementById('encoder-hwaccel-hint');
+        if (!hint) return;
+
+        const val = select.value;
+        const hwaccelMap = {
+            'h264_qsv': 'Intel QSV \u2192 hwaccel: qsv',
+            'h264_amf': 'AMD AMF \u2192 hwaccel: d3d11va',
+            'h264_nvenc': 'NVIDIA NVENC \u2192 hwaccel: cuda',
+        };
+
+        if (hwaccelMap[val]) {
+            hint.textContent = hwaccelMap[val];
+            hint.className = 'text-xs text-amber-400 mt-1';
+        } else {
+            hint.textContent = 'Software encoding (no hwaccel)';
+            hint.className = 'text-xs text-slate-500 mt-1';
         }
     },
 
@@ -457,7 +540,7 @@ const App = {
         const btn = document.getElementById('btn-detect-encoder');
         const status = document.getElementById('encoder-status');
         const originalText = btn.textContent;
-        
+
         btn.textContent = 'Detecting...';
         btn.disabled = true;
         status.textContent = '';
@@ -465,13 +548,18 @@ const App = {
         try {
             const res = await fetch('/api/encoders/best');
             const data = await res.json();
-            
+
             const select = document.getElementById('encoder-select');
             select.value = data.encoder;
-            
-            status.textContent = `Selected: ${data.name}${data.is_hardware ? ' (Hardware)' : ''}`;
+
+            let statusMsg = `Selected: ${data.name}`;
+            if (data.is_hardware && data.hwaccel_name) {
+                statusMsg += ` + ${data.hwaccel_name}`;
+            }
+            status.textContent = statusMsg;
             status.className = 'text-xs text-green-400 mt-1';
-            
+
+            this.updateEncoderHwaccelHint();
             this.debounceSaveSettings();
         } catch (err) {
             status.textContent = 'Failed to detect encoder';
@@ -523,19 +611,19 @@ const App = {
 
     getSelectedAudioDevices() {
         const checked = document.querySelectorAll('#audio-devices-list input[type="checkbox"]:checked');
-        return Array.from(checked).map(cb => cb.value);
+        return Array.from(checked).map(cb => parseInt(cb.value));
     },
 
     async loadSettings() {
         try {
             await this.loadEncoders();
-            
+
             const res = await fetch('/api/settings');
             this.settings = await res.json();
 
             document.getElementById('fps-slider').value = this.settings.fps || 30;
             document.getElementById('fps-value').textContent = (this.settings.fps || 30) + ' fps';
-            
+
             const encoderSelect = document.getElementById('encoder-select');
             if (encoderSelect.querySelector(`option[value="${this.settings.encoder}"]`)) {
                 encoderSelect.value = this.settings.encoder || 'mpeg4';
@@ -546,6 +634,7 @@ const App = {
             mouseToggle.setAttribute('aria-checked', this.settings.draw_mouse !== false);
 
             this.setAudioMode(this.settings.audio_mode || 'default');
+            this.updateEncoderHwaccelHint();
         } catch (err) { /* use defaults */ }
     },
 
@@ -569,25 +658,23 @@ const App = {
             if (this.devices.audio && this.devices.audio.length > 0) {
                 const selectedDevices = this.settings.audio_devices || [];
                 audList.innerHTML = this.devices.audio.map(dev => {
-                    const checked = selectedDevices.includes(dev.name) ? 'checked' : '';
-                    const typeLabel = dev.device_type === 'output'
-                        ? '<span class="text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">扬声器</span>'
-                        : '<span class="text-xs px-1.5 py-0.5 rounded bg-green-500/20 text-green-400">麦克风</span>';
+                    const checked = selectedDevices.includes(dev.id) ? 'checked' : '';
                     return `
                         <label class="flex items-center gap-3 py-2 px-2 rounded-lg hover:bg-slate-700 cursor-pointer
                                       transition-colors duration-200 min-h-[44px]">
-                            <input type="checkbox" value="${this.escapeHtml(dev.name)}" ${checked}
+                            <input type="checkbox" value="${dev.id}" ${checked}
                                 class="w-4 h-4 rounded border-slate-600 bg-slate-700 text-blue-500
                                        focus:ring-blue-500/50 cursor-pointer"
                                 onchange="App.debounceSaveSettings()">
                             <div class="min-w-0 flex-1">
-                                <p class="text-sm text-slate-200 truncate">${this.escapeHtml(dev.name)} ${typeLabel}</p>
+                                <p class="text-sm text-slate-200 truncate">${this.escapeHtml(dev.name)}</p>
+                                <p class="text-xs text-slate-500">${this.escapeHtml(dev.api)}</p>
                             </div>
                         </label>
                     `;
                 }).join('');
             } else {
-                audList.innerHTML = '<p class="text-slate-500 text-sm py-2">No audio devices found</p>';
+                audList.innerHTML = '<p class="text-slate-500 text-sm py-2">No audio input devices found</p>';
             }
         } catch (err) { /* silently fail */ }
     },

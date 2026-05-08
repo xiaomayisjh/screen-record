@@ -6,18 +6,24 @@ import time
 from datetime import datetime
 
 from .audio import StreamingAudioRecorder
-from .cmd_builder import CmdBuilder
+from .cmd_builder import CmdBuilder, ENCODER_HWACCEL_MAP, HW_ENCODERS
 from .webcam import DeviceEnumerator, WebcamCapturer
-from .settings_manager import SettingsManager
+from .settings_manager import SettingsManager, ENCODER_NAMES
+from .repair import (
+    FileHealthChecker, write_recording_marker,
+    read_recording_marker, delete_recording_marker,
+)
 
 
 _startupinfo = subprocess.STARTUPINFO()
 _startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 _startupinfo.wShowWindow = subprocess.SW_HIDE
 
+MAX_FALLBACK_RETRIES = 2
+
 
 class RecordingEngine:
-    """Thread-safe recording orchestrator."""
+    """Thread-safe recording orchestrator with hardware acceleration fallback."""
 
     def __init__(self, base_dir, settings):
         self.base_dir = base_dir
@@ -33,7 +39,6 @@ class RecordingEngine:
 
         self._state = "idle"
         self._lock = threading.Lock()
-        # Use Condition + version counter for multi-client SSE support
         self._state_condition = threading.Condition(self._lock)
         self._state_version = 0
         self._video_proc = None
@@ -44,9 +49,25 @@ class RecordingEngine:
         self._filename = None
         self._error_message = None
         self._stderr_file = None
+        self._fallback_count = 0
+        self._original_encoder = None
+        self._current_encoder = None
+        self._current_hwaccel = None
+        self._fallback_info = None
+        self.health_checker = FileHealthChecker(
+            os.path.join(base_dir, "ffmpeg.exe"), self.captures_dir
+        )
 
         os.makedirs(self.captures_dir, exist_ok=True)
         self._cleanup_tmp()
+        repair_result = self.health_checker.auto_repair_on_startup()
+        if repair_result.repaired or repair_result.failed:
+            import logging
+            log = logging.getLogger("engine")
+            for name in repair_result.repaired:
+                log.info("Auto-repaired: %s", name)
+            for item in repair_result.failed:
+                log.warning("Auto-repair failed: %s — %s", item["name"], item["error"])
 
     def _notify_state_change(self):
         """Must be called with self._lock held."""
@@ -66,6 +87,10 @@ class RecordingEngine:
             "filename": self._filename,
             "elapsed": 0,
             "error": self._error_message,
+            "encoder": self._current_encoder,
+            "hwaccel": self._current_hwaccel,
+            "fallback": self._fallback_info,
+            "output_path": os.path.join(self.captures_dir, self._filename) if self._filename else None,
         }
         if self._state == "recording" and self._recording_start:
             result["elapsed"] = time.time() - self._recording_start
@@ -98,73 +123,112 @@ class RecordingEngine:
 
             self._filename = config.get("filename") or self.generate_filename()
             self._error_message = None
+            self._fallback_count = 0
+            self._fallback_info = None
 
             os.makedirs(self.captures_dir, exist_ok=True)
             os.makedirs(self.tmp_dir, exist_ok=True)
 
             s = self.settings.get_all()
-            self.cmd_builder.config(
-                fps=s["fps"],
-                encoder=s["encoder"],
-                draw_mouse=s["draw_mouse"],
-            )
-            self.cmd_builder.set_source(
-                config.get("source") == "title",
-                config.get("window_title", ""),
-            )
+            self._original_encoder = s["encoder"]
+            self._current_encoder = s["encoder"]
+            self._current_hwaccel = ENCODER_HWACCEL_MAP.get(s["encoder"])
 
-            # Redirect FFmpeg stderr to a temp file to avoid pipe buffer deadlock
-            self._recording_start = time.time()
-            tmp_video = os.path.join(self.tmp_dir, "tmp.mkv")
-            video_cmd = self.cmd_builder.get_capture_cmd(tmp_video)
-            self._stderr_file = open(
-                os.path.join(self.tmp_dir, "ffmpeg_stderr.log"), "w",
-                encoding="utf-8", errors="replace",
-            )
-            self._video_proc = subprocess.Popen(
-                args=video_cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=self._stderr_file,
-                startupinfo=_startupinfo,
-            )
-
-            self._audio_start = time.time()
-            audio_devices = s.get("audio_devices", [])
-            if s.get("audio_mode") == "default" or not audio_devices:
-                self.audio_recorder.devices = [None]
-            else:
-                self.audio_recorder.devices = audio_devices
-
-            has_input = False
-            try:
-                for i in range(self.audio_recorder.get_device_count()):
-                    if self.audio_recorder.is_input_device(i):
-                        has_input = True
-                        break
-            except Exception:
-                pass
-
-            if has_input:
-                self.audio_recorder.record(os.path.join(self.tmp_dir, "tmp.wav"))
-            else:
-                self.audio_recorder.devices = []
-
-            if config.get("webcam") and config.get("webcam_device"):
-                self._webcam_capturer = WebcamCapturer(self.base_dir)
-                self._webcam_capturer.set_device(config["webcam_device"])
-                self._webcam_capturer.start(
-                    os.path.join(self.tmp_dir, "webcamtmp.mkv")
-                )
-                self.cmd_builder.config(webcam=True)
-            else:
-                self._webcam_capturer = None
-                self.cmd_builder.config(webcam=False)
+            self._start_capture(s, config)
 
             self._state = "recording"
             self._notify_state_change()
 
         threading.Thread(target=self._monitor, daemon=True).start()
+
+    def _start_capture(self, settings, config):
+        self.cmd_builder.config(
+            fps=settings["fps"],
+            encoder=self._current_encoder,
+            draw_mouse=settings["draw_mouse"],
+        )
+        self.cmd_builder.set_source(
+            config.get("source") == "title",
+            config.get("window_title", ""),
+        )
+
+        self._current_hwaccel = self.cmd_builder.hwaccel
+
+        output_path = os.path.join(self.captures_dir, self._filename)
+        video_cmd = self.cmd_builder.get_capture_cmd(output_path)
+        self._stderr_file = open(
+            os.path.join(self.tmp_dir, "ffmpeg_stderr.log"), "w",
+            encoding="utf-8", errors="replace",
+        )
+        self._video_proc = subprocess.Popen(
+            args=video_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=self._stderr_file,
+            startupinfo=_startupinfo,
+        )
+
+        self._recording_start = time.time()
+
+        write_recording_marker(
+            self.captures_dir, self._filename,
+            self._current_encoder, self._current_hwaccel,
+        )
+
+        audio_devices = settings.get("audio_devices", [])
+        if settings.get("audio_mode") == "default" or not audio_devices:
+            self.audio_recorder.devices = [None]
+        else:
+            self.audio_recorder.devices = audio_devices
+
+        has_input = False
+        try:
+            for i in range(self.audio_recorder.get_device_count()):
+                if self.audio_recorder.is_input_device(i):
+                    has_input = True
+                    break
+        except Exception:
+            pass
+
+        if has_input:
+            self.audio_recorder.record(os.path.join(self.tmp_dir, "tmp.wav"))
+        else:
+            self.audio_recorder.devices = []
+
+        if config.get("webcam") and config.get("webcam_device"):
+            self._webcam_capturer = WebcamCapturer(self.base_dir)
+            self._webcam_capturer.set_device(config["webcam_device"])
+            self._webcam_capturer.start(
+                os.path.join(self.tmp_dir, "webcamtmp.mkv")
+            )
+            self.cmd_builder.config(webcam=True)
+        else:
+            self._webcam_capturer = None
+            self.cmd_builder.config(webcam=False)
+
+    def _attempt_fallback(self):
+        if self._fallback_count >= MAX_FALLBACK_RETRIES:
+            return False
+
+        fallback_encoder = self.settings.get_fallback_encoder(self._current_encoder)
+        if not fallback_encoder or fallback_encoder == self._current_encoder:
+            return False
+
+        self._fallback_count += 1
+        old_encoder = self._current_encoder
+        old_name = ENCODER_NAMES.get(old_encoder, old_encoder)
+        new_name = ENCODER_NAMES.get(fallback_encoder, fallback_encoder)
+
+        self._current_encoder = fallback_encoder
+        self._fallback_info = {
+            "original_encoder": self._original_encoder,
+            "current_encoder": fallback_encoder,
+            "fallback_from": old_encoder,
+            "fallback_count": self._fallback_count,
+            "message": f"{old_name} failed, fallback to {new_name}",
+        }
+
+        return True
 
     def stop_recording(self):
         with self._lock:
@@ -213,6 +277,30 @@ class RecordingEngine:
             if self._video_proc and self._video_proc.poll() is not None:
                 self._close_stderr_file()
                 stderr_out = self._read_stderr_log()
+
+                if self._current_encoder in HW_ENCODERS and self._attempt_fallback():
+                    self._cleanup_tmp()
+                    os.makedirs(self.tmp_dir, exist_ok=True)
+
+                    s = self.settings.get_all()
+                    config = {
+                        "source": "desktop" if self.cmd_builder.source == "desktop" else "title",
+                        "window_title": self.cmd_builder.source.replace("title=", "") if self.cmd_builder.source.startswith("title=") else "",
+                        "webcam": self._webcam_capturer is not None,
+                        "webcam_device": self._webcam_capturer._device if self._webcam_capturer else "",
+                    }
+
+                    if self._webcam_capturer:
+                        self._webcam_capturer.stop()
+                        self._webcam_capturer = None
+                    self.audio_recorder.stop()
+
+                    self._start_capture(s, config)
+
+                    with self._lock:
+                        self._notify_state_change()
+                    continue
+
                 with self._lock:
                     self._error_message = f"FFmpeg crashed: {stderr_out}"
                     self._state = "idle"
@@ -220,33 +308,50 @@ class RecordingEngine:
                 self.audio_recorder.stop()
                 if self._webcam_capturer:
                     self._webcam_capturer.stop()
+                delete_recording_marker(self.captures_dir)
                 self._cleanup_tmp()
                 return
             time.sleep(1.0)
 
     def _merge(self):
         try:
-            audio_delay_ms = 0
-            if self._audio_start and self._recording_start:
-                delay = self._audio_start - self._recording_start
-                if delay > 0:
-                    audio_delay_ms = int(delay * 1000)
-
             output_path = os.path.join(self.captures_dir, self._filename)
             audio_ok = self._check_audio_files()
+            has_webcam = self._webcam_capturer is not None
 
-            if not audio_ok:
-                tmp_video = os.path.join(self.tmp_dir, "tmp.mkv")
-                if os.path.exists(tmp_video):
-                    shutil.copy2(tmp_video, output_path)
-                else:
-                    self._error_message = "Video file not found after recording"
+            if not audio_ok and not has_webcam:
+                tmp_remux = output_path + ".remux.mp4"
+                remux_cmd = self.cmd_builder.get_remux_cmd(output_path, tmp_remux)
+                stderr_file = open(
+                    os.path.join(self.tmp_dir, "remux_stderr.log"), "w",
+                    encoding="utf-8", errors="replace",
+                )
+                proc = subprocess.Popen(
+                    args=remux_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    startupinfo=_startupinfo,
+                )
+                proc.wait()
+                stderr_file.close()
+                if proc.returncode == 0 and os.path.isfile(tmp_remux):
+                    os.replace(tmp_remux, output_path)
+                elif os.path.isfile(tmp_remux):
+                    os.remove(tmp_remux)
             else:
+                tmp_merged = output_path + ".merged.mp4"
+                audio_delay_ms = 0
+                if self._audio_start and self._recording_start:
+                    delay = self._audio_start - self._recording_start
+                    if delay > 0:
+                        audio_delay_ms = int(delay * 1000)
+
                 devices = self.audio_recorder.devices
                 self.cmd_builder.config(
                     aud_list=devices, audio_delay_ms=audio_delay_ms
                 )
-                merge_cmd = self.cmd_builder.get_merge_cmd(output_path)
+                merge_cmd = self.cmd_builder.get_merge_cmd(tmp_merged)
                 stderr_file = open(
                     os.path.join(self.tmp_dir, "merge_stderr.log"), "w",
                     encoding="utf-8", errors="replace",
@@ -272,10 +377,17 @@ class RecordingEngine:
                     self._error_message = (
                         f"Merge failed (exit {self._merge_proc.returncode}): {merge_err}"
                     )
+                    if os.path.isfile(tmp_merged):
+                        os.remove(tmp_merged)
+                else:
+                    if os.path.isfile(tmp_merged):
+                        os.replace(tmp_merged, output_path)
 
+            delete_recording_marker(self.captures_dir)
             self._cleanup_tmp()
         except Exception as e:
             self._error_message = str(e)
+            delete_recording_marker(self.captures_dir)
         finally:
             with self._lock:
                 self._state = "idle"
@@ -295,6 +407,15 @@ class RecordingEngine:
         self._close_stderr_file()
         if os.path.isdir(self.tmp_dir):
             shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def check_files_health(self):
+        return self.health_checker.check_all_files()
+
+    def repair_file(self, name):
+        return self.health_checker.repair_file(name)
+
+    def repair_all_files(self):
+        return self.health_checker.repair_all()
 
     def list_files(self):
         files = []
